@@ -16,9 +16,9 @@ Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRBW + NEO_KHZ800);
 Adafruit_NeoPixel statusLED(LED_STATUS_COUNT, LED_STATUS_PIN, NEO_GRB + NEO_KHZ800);
 
 
-const char* defaultSSID = "Rapido";
-const char* defaultPassword = "thequickbrownfoxjumpedoverthelazydog";
-const char* defaultShellyIP = "10.1.87.48";
+const char* defaultSSID = "xxxxxx";
+const char* defaultPassword = "xxxxxx";
+const char* defaultShellyIP = "192.168.x.x";
 
 char ssid[32] = "";
 char password[64] = "";
