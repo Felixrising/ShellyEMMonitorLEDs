@@ -5,33 +5,39 @@
 #include <EEPROM.h>
 #include <Adafruit_NeoPixel.h>
 
+// #define USE_WS2812B_FOR_STATUS // Uncomment for WS2812B LED, comment out for regular PWM LED
+
 #define MAX_BRIGHTNESS 255
 int globalBrightness = 32; // Example global led brightness as a %
-#define LED_PIN     6
-#define LED_COUNT   144
+#define LED_PIN 4
+#define LED_COUNT 60
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRBW + NEO_KHZ800);
 
-#define LED_STATUS_PIN 7 // WS2812B LED on GPIO7
+#ifndef USE_WS2812B_FOR_STATUS
+#define LED_STATUS_PIN 8 // Regular PWM LED on GPIO8 for status
+#endif
+
+#ifdef USE_WS2812B_FOR_STATUS
+#define LED_STATUS_PIN 7 // WS2812B LED on GPIO7 for status
 #define LED_STATUS_COUNT 1
 Adafruit_NeoPixel statusLED(LED_STATUS_COUNT, LED_STATUS_PIN, NEO_GRB + NEO_KHZ800);
+#endif
 
-
-const char* defaultSSID = "xxxxxx";
-const char* defaultPassword = "xxxxxx";
-const char* defaultShellyIP = "192.168.x.x";
+const char *defaultSSID = "IoT-2.4G";
+const char *defaultPassword = "thequickbrownfoxjumped";
+const char *defaultShellyIP = "10.1.87.48";
 
 char ssid[32] = "";
 char password[64] = "";
 char shellyIP[16] = "";
 
 unsigned long previousMillis = 0;
-const long dataUpdateInterval = 1000; // 6 seconds
-const long loopDelay = 2; // Let CPUs do some background work and not block.
+const long dataUpdateInterval = 1000; // 1 second
+const long loopDelay = 2;             // Let CPUs do some background work and not block.
 unsigned long lastDataUpdateTime = 0;
 unsigned long DataUpdateTime = 0;
-bool newDataAvailable = false; // ttrack when new data is available from energy meter.
-int calculatedValue = 0; // Variable for storing the calculated value
-
+bool newDataAvailable = false; // Track when new data is available from energy meter.
+int calculatedValue = 0;       // Variable for storing the calculated value
 
 struct EnergyMeter
 {
@@ -46,45 +52,86 @@ EnergyMeter meters[3] = {
 
 WebServer server(80);
 
+void blinkPWMLED(uint8_t pin, unsigned long interval, int blinks)
+{
+    static unsigned long lastBlinkTime = 0;
+    static int blinkCount = 0;
+    static bool ledState = false;
 
+    unsigned long currentMillis = millis();
 
-void reconnectWiFi(const char* newSSID, const char* newPassword) {
+    if (blinkCount < blinks * 2)
+    {
+        if (currentMillis - lastBlinkTime >= interval)
+        {
+            lastBlinkTime = currentMillis;
+            ledState = !ledState;
+            digitalWrite(pin, ledState ? HIGH : LOW); // Toggle LED state
+            if (!ledState)
+            {
+                blinkCount++;
+            }
+        }
+    }
+    else
+    {
+        blinkCount = 0;         // Reset for the next sequence
+        digitalWrite(pin, LOW); // Ensure LED is off after blinking
+    }
+}
+
+void reconnectWiFi(const char *newSSID, const char *newPassword)
+{
     WiFi.disconnect();
     WiFi.begin(newSSID, newPassword);
     unsigned long startTime = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - startTime < 10000) {
+    while (WiFi.status() != WL_CONNECTED && millis() - startTime < 10000)
+    {
         delay(500);
         Serial.print(".");
     }
 }
 
-void updateEnergyMeterData() {
+void updateEnergyMeterData()
+{
     bool allDataFetched = true; // Start with the assumption that all data will be fetched
-    calculatedValue = 0; // Variable for storing the calculated value
+    calculatedValue = 0;        // Variable for storing the calculated value
 
     HTTPClient http;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 3; i++)
+    {
+#ifdef USE_WS2812B_FOR_STATUS
         statusLED.setPixelColor(0, statusLED.Color(0, 0, 0)); // Black color
         statusLED.show();
+#else
+        blinkPWMLED(LED_STATUS_PIN, 500, 1); // One blink for start
+#endif
 
         String url = "http://" + String(shellyIP) + "/rpc/EM1.GetStatus?id=" + String(i);
         http.begin(url);
         int httpCode = http.GET();
 
-        if (httpCode > 0) {
+        if (httpCode > 0)
+        {
             String payload = http.getString();
             DynamicJsonDocument doc(1024);
             deserializeJson(doc, payload);
             meters[i].act_power = (int)doc["act_power"].as<float>();
 
-            if (meters[i].name == "Solar") {
+            if (meters[i].name == "Solar")
+            {
                 meters[i].act_power = -meters[i].act_power;
             }
 
-            statusLED.setPixelColor(0, statusLED.Color(0, 255, 0)); // Green color
-            statusLED.setBrightness(1); 
+#ifdef USE_WS2812B_FOR_STATUS
+            statusLED.setPixelColor(0, statusLED.Color(0, 255, 0)); // Green color for success
             statusLED.show();
-        } else {
+#else
+            blinkPWMLED(LED_STATUS_PIN, 500, 3); // Three blinks for success
+#endif
+        }
+        else
+        {
             allDataFetched = false; // Set to false if any data fetch fails
             // Optionally, break out of the loop if one fails
             break;
@@ -92,55 +139,64 @@ void updateEnergyMeterData() {
         http.end();
     }
 
-    if (allDataFetched) {
+    if (allDataFetched)
+    {
         // Compute the calculatedValue here after all data is fetched
         calculatedValue = meters[1].act_power + meters[0].act_power; // Assuming meters[1] is solar and meters[0] is grid
 
         newDataAvailable = true; // Update the flag only if all data is successfully fetched
-        DataUpdateTime = millis(); 
-        Serial.print("Data update inverval: "+ String(DataUpdateTime - lastDataUpdateTime) + ", ");
+        DataUpdateTime = millis();
+        Serial.print("Data update inverval: " + String(DataUpdateTime - lastDataUpdateTime) + ", ");
         lastDataUpdateTime = DataUpdateTime; // Update timestamp after fetching new data
-    } else {
+    }
+    else
+    {
         newDataAvailable = false; // Ensure the flag is not set if data fetching fails
     }
 
+#ifdef USE_WS2812B_FOR_STATUS
     statusLED.setPixelColor(0, statusLED.Color(0, 128, 0)); // Green color
-    statusLED.setBrightness(1); 
     statusLED.show();
+#else
+    blinkPWMLED(LED_STATUS_PIN, 500, 2); // Two blinks to indicate end of data fetching
+#endif
 }
 
-
-bool tryConnectWiFi(const char* ssid, const char* password) {
+bool tryConnectWiFi(const char *ssid, const char *password)
+{
     WiFi.disconnect();
     WiFi.begin(ssid, password);
     unsigned long startTime = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - startTime < 10000) {
+    while (WiFi.status() != WL_CONNECTED && millis() - startTime < 10000)
+    {
         delay(500);
         Serial.print(".");
     }
     return WiFi.status() == WL_CONNECTED;
 }
 
-int scaledBrightness(int brightness) {
-    if (brightness <= 0) return 0;
-    if (brightness >= MAX_BRIGHTNESS) return MAX_BRIGHTNESS;
+int scaledBrightness(int brightness)
+{
+    if (brightness <= 0)
+        return 0;
+    if (brightness >= MAX_BRIGHTNESS)
+        return MAX_BRIGHTNESS;
 
     // Use floating-point arithmetic for precision
     float scale = (float)globalBrightness / MAX_BRIGHTNESS;
     int newBrightness = (int)(brightness * scale);
 
     // Optional: ensure minimum brightness of 1
-    if (newBrightness <= 0) return 1;
-    
+    if (newBrightness <= 0)
+        return 1;
+
     return min(newBrightness, MAX_BRIGHTNESS);
 }
 
-int scaledBrightness() {
+int scaledBrightness()
+{
     return scaledBrightness(globalBrightness);
 }
-
-
-
 
 // void displayMetricsOnStrip() {
 //     int consumerValue = meters[2].act_power;
@@ -162,40 +218,48 @@ int scaledBrightness() {
 //     strip.show(); // Update the LED strip
 // }
 
-void displayMetricsOnStrip() {
+void displayMetricsOnStrip()
+{
     int consumerValue = meters[2].act_power;
     int solarValue = meters[1].act_power;
-    for (int i = 0; i < LED_COUNT; i++) {
+    for (int i = 0; i < LED_COUNT; i++)
+    {
         int ledValue = map(i, 0, LED_COUNT - 1, 100, 5000);
-        if (ledValue <= consumerValue) {
-            if (ledValue <= solarValue) { // both values are less than or equal to solarValue. got to be green!
+        if (ledValue <= consumerValue)
+        {
+            if (ledValue <= solarValue)
+            { // both values are less than or equal to solarValue. got to be green!
                 // Spring Bud Green
                 strip.setPixelColor(i, strip.Color(
-                    scaledBrightness(153),
-                    scaledBrightness(255),
-                    0, 0));
-            } else { // else consumerValue exceeds solarValue
+                                           scaledBrightness(153),
+                                           scaledBrightness(255),
+                                           0, 0));
+            }
+            else
+            { // else consumerValue exceeds solarValue
                 // Light Orange
                 strip.setPixelColor(i, strip.Color(
-                    scaledBrightness(255),
-                    0,
-                    0, 0));
+                                           scaledBrightness(255),
+                                           0,
+                                           0, 0));
             }
-        } else if (ledValue <= solarValue) {  // solarValue exceeds consumerValue then mark LEDs blue.
+        }
+        else if (ledValue <= solarValue)
+        { // solarValue exceeds consumerValue then mark LEDs blue.
             // Vivid Sky Blue
             strip.setPixelColor(i, strip.Color(
-                0,
-                scaledBrightness(204),
-                scaledBrightness(255),
-                0));
-        } else {
+                                       0,
+                                       scaledBrightness(204),
+                                       scaledBrightness(255),
+                                       0));
+        }
+        else
+        {
             strip.setPixelColor(i, strip.Color(0, 0, 0, 0)); // Off
         }
     }
     strip.show(); // Update the LED strip
 }
-
-
 
 void handleRoot()
 {
@@ -224,7 +288,7 @@ void handleRoot()
     html += "}).catch(error => console.log(error));";
     html += "}";
     html += "setInterval(fetchData, " + String(dataUpdateInterval) + ");";
-    html += "fetchData();";                  // Initial fetch
+    html += "fetchData();"; // Initial fetch
     html += "</script>";
     html += "<button onclick=\"location.href='/config'\">Configuration</button>";
     html += "</body></html>";
@@ -243,14 +307,17 @@ void saveConfig()
     EEPROM.end();
 }
 
-void handleConfig() {
-    if (server.method() == HTTP_POST) {
+void handleConfig()
+{
+    if (server.method() == HTTP_POST)
+    {
         char newSSID[32] = "";
         char newPassword[64] = "";
         strncpy(newSSID, server.arg("ssid").c_str(), sizeof(newSSID));
         strncpy(newPassword, server.arg("password").c_str(), sizeof(newPassword));
 
-        if (tryConnectWiFi(newSSID, newPassword)) {
+        if (tryConnectWiFi(newSSID, newPassword))
+        {
             strncpy(ssid, newSSID, sizeof(ssid));
             strncpy(password, newPassword, sizeof(password));
             strncpy(shellyIP, server.arg("shellyIP").c_str(), sizeof(shellyIP));
@@ -258,16 +325,20 @@ void handleConfig() {
             Serial.println("\nConnected to new WiFi network.");
             Serial.print("New IP Address: ");
             Serial.println(WiFi.localIP());
-        } else {
+        }
+        else
+        {
             Serial.println("\nFailed to connect to new WiFi network. Reverting to old credentials.");
-            tryConnectWiFi(ssid, password);  // Attempt to reconnect with old credentials
+            tryConnectWiFi(ssid, password); // Attempt to reconnect with old credentials
             Serial.print("IP Address: ");
             Serial.println(WiFi.localIP());
         }
 
         server.sendHeader("Location", "/");
         server.send(303);
-    } else {
+    }
+    else
+    {
         String html = "<!DOCTYPE html><html><body>";
         html += "<form action='/config' method='post'>";
         html += "SSID: <input type='text' name='ssid' value='" + String(ssid) + "'><br>";
@@ -280,16 +351,45 @@ void handleConfig() {
     }
 }
 
-void clearEEPROM() {
-    statusLED.setPixelColor(0, statusLED.Color(255, 255, 0)); // Yellow color for EEPROM wipe
+void clearEEPROM()
+{
+// Indicate EEPROM clearing process
+#ifdef USE_WS2812B_FOR_STATUS
+    statusLED.begin();                                        // Ensure the LED is initialized
+    statusLED.setPixelColor(0, statusLED.Color(255, 255, 0)); // Set WS2812B LED to yellow for EEPROM clearing indication
     statusLED.show();
+    delay(1000); // Keep the LED on for a duration to indicate the process
+#else
+    pinMode(LED_STATUS_PIN, OUTPUT);
+    // Blink PWM LED rapidly to indicate EEPROM clearing
+    for (int i = 0; i < 10; i++)
+    {
+        digitalWrite(LED_STATUS_PIN, HIGH);
+        delay(100); // On duration
+        digitalWrite(LED_STATUS_PIN, LOW);
+        delay(100); // Off duration
+    }
+#endif
 
     EEPROM.begin(512);
-    for (int i = 0; i < 512; i++) {
+    for (int i = 0; i < 512; i++)
+    {
         EEPROM.write(i, 0);
     }
     EEPROM.commit();
     EEPROM.end();
+
+// Indicate EEPROM has been cleared
+#ifdef USE_WS2812B_FOR_STATUS
+    statusLED.setPixelColor(0, statusLED.Color(0, 255, 0)); // Set WS2812B LED to green to indicate completion
+    statusLED.show();
+    delay(1000); // Keep the LED on for a duration to indicate completion
+#else
+    // Turn on PWM LED solid for a short duration to indicate completion
+    digitalWrite(LED_STATUS_PIN, HIGH);
+    delay(2000); // On duration to indicate completion
+    digitalWrite(LED_STATUS_PIN, LOW);
+#endif
 }
 
 void loadConfig()
@@ -330,7 +430,6 @@ void handleJson()
             if (i > 0)
                 json += ",";
             json += "{\"name\":\"" + meters[i].name + "\",\"power\":" + String(meters[i].act_power) + "}";
-
         }
         json += "]";
         server.send(200, "application/json", json);
@@ -342,7 +441,8 @@ void handleJson()
     }
 }
 
-void setupWebServer() {
+void setupWebServer()
+{
     server.on("/", handleRoot);
     server.on("/data", handleJson);
     server.on("/config", handleConfig);
@@ -354,21 +454,25 @@ void setup()
 {
     Serial.begin(115200);
 
-
-    strip.begin(); // Initialize the LED strip
+    // Initialize the main LED strip
+    strip.begin();
     strip.setBrightness(scaledBrightness());
-    strip.setPixelColor(0, strip.Color(0, 128, 0, 0)); // Red color
-    strip.show();  // Turn off all pixels (clear the strip)
+    strip.show(); // Clear the strip
 
+    // Status LED setup for WS2812B or PWM LED
+#ifdef USE_WS2812B_FOR_STATUS
     statusLED.begin();
-    statusLED.setPixelColor(0, statusLED.Color(255, 165, 0)); // Orange color
-    statusLED.setBrightness(1); 
+    statusLED.setPixelColor(0, statusLED.Color(255, 165, 0)); // Orange color for WS2812B
     statusLED.show();
+#else
+    pinMode(LED_STATUS_PIN, OUTPUT);
+    digitalWrite(LED_STATUS_PIN, LOW); // Ensure PWM LED is off initially
+#endif
 
     delay(5000); // Ensure serial connection is established for monitoring
 
     // Uncomment the next line to clear EEPROM during troubleshooting
-    //clearEEPROM();
+    EEPROM();
 
     loadConfig(); // Load configuration
 
@@ -380,9 +484,20 @@ void setup()
     Serial.print("Shelly IP: ");
     Serial.println(shellyIP);
 
-    statusLED.setPixelColor(0, statusLED.Color(255, 255, 0)); // Yellow color
-    statusLED.setBrightness(1); 
+    // Indicate WiFi connection attempt
+#ifdef USE_WS2812B_FOR_STATUS
+    statusLED.setPixelColor(0, statusLED.Color(255, 255, 0)); // Yellow color for WS2812B during connection attempt
     statusLED.show();
+#else
+    // For PWM LED, blink rapidly to indicate connection attempt
+    for (int i = 0; i < 10; i++)
+    {
+        digitalWrite(LED_STATUS_PIN, HIGH);
+        delay(100);
+        digitalWrite(LED_STATUS_PIN, LOW);
+        delay(100);
+    }
+#endif
 
     WiFi.begin(ssid, password);
     while (WiFi.status() != WL_CONNECTED)
@@ -391,9 +506,15 @@ void setup()
         Serial.print(".");
     }
 
-    statusLED.setPixelColor(0, statusLED.Color(0, 128, 0)); // Green color
-    statusLED.setBrightness(1); 
+// Indicate successful WiFi connection
+#ifdef USE_WS2812B_FOR_STATUS
+    statusLED.setPixelColor(0, statusLED.Color(0, 255, 0)); // Green color for WS2812B on successful connection
     statusLED.show();
+#else
+    digitalWrite(LED_STATUS_PIN, HIGH); // Keep PWM LED on to indicate successful connection
+    delay(2000);                        // Keep on for 2 seconds
+    digitalWrite(LED_STATUS_PIN, LOW);
+#endif
 
     Serial.println("\nConnected to WiFi");
     Serial.print("My IP: http://");
@@ -413,12 +534,10 @@ void loop()
 
         // Update energy meter data
         updateEnergyMeterData();
-
-
     }
 
-        // Update Strip
-        displayMetricsOnStrip();
+    // Update Strip
+    displayMetricsOnStrip();
 
     if (newDataAvailable)
     {
