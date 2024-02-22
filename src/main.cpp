@@ -472,7 +472,7 @@ void setup()
     delay(5000); // Ensure serial connection is established for monitoring
 
     // Uncomment the next line to clear EEPROM during troubleshooting
-    clearEEPROM();
+    // clearEEPROM();
 
     loadConfig(); // Load configuration
 
