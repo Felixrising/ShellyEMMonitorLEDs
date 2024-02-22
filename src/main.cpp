@@ -23,9 +23,9 @@ Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRBW + NEO_KHZ800);
 Adafruit_NeoPixel statusLED(LED_STATUS_COUNT, LED_STATUS_PIN, NEO_GRB + NEO_KHZ800);
 #endif
 
-const char *defaultSSID = "IoT-2.4G";
-const char *defaultPassword = "thequickbrownfoxjumped";
-const char *defaultShellyIP = "10.1.87.48";
+const char *defaultSSID = "xxxxx";
+const char *defaultPassword = "xxxxx";
+const char *defaultShellyIP = "xxx";
 
 char ssid[32] = "";
 char password[64] = "";
@@ -472,7 +472,7 @@ void setup()
     delay(5000); // Ensure serial connection is established for monitoring
 
     // Uncomment the next line to clear EEPROM during troubleshooting
-    EEPROM();
+    clearEEPROM();
 
     loadConfig(); // Load configuration
 
