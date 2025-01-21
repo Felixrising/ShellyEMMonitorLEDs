@@ -1,70 +1,93 @@
 # Shelly Pro EM3 Energy Monitor LED Meter
 
 ## Project Overview
-The Shelly Pro EM3 Energy Monitor LED Meter is designed to help homeowners effectively use renewable energy. It connects to a Shelly Pro 3EM energy meter to display real-time data on Grid power, Solar power, and household consumption. This project uses an RGB LED strip for visual feedback on energy usage and is compatible with Espressif boards (ESP32 recommended, ESP8266 with modifications).
+The Shelly Pro EM3 Energy Monitor LED Meter helps homeowners track and manage energy usage effectively, especially with renewable energy sources. It connects to a Shelly Pro 3EM energy meter to display real-time data on Grid power, Solar power, and household consumption using an LED strip for visual feedback. This project uses an ESP32 board for processing and connectivity, with potential for ESP8266 support with modifications.
+
+**Important:** The Shelly Pro 3EM must be configured to run in monophase mode for this project. In this setup, use one CT (current transformer) clamp on the solar inverter feed-in and one on the consumer feed. With minor changes to the code, a configuration for measuring both Grid and Solar could be implemented in the future.
 
 ## Purpose
-This device aims to assist homeowners in optimizing their use of renewable energy by providing an easy-to-understand display system. The LED strip offers clear indications to help make informed decisions about energy consumption.
+This device assists homeowners in optimizing their renewable energy usage by providing an intuitive LED display and interactive web interface. It offers immediate visual feedback on energy consumption and detailed historical data visualization, enabling informed energy management decisions.
 
 ## LED Indications
-- Green LEDs: Indicate energy usage from Solar sources.
-- Cyan/Blue LEDs: Indicate excess Solar energy being fed into the Grid.
-- Red LEDs: Indicate energy consumption from the Grid.
+- **Green LEDs:** Indicate energy usage from Solar sources.
+- **Cyan/Blue LEDs:** Indicate excess Solar energy fed into the Grid.
+- **Red LEDs:** Indicate energy consumption from the Grid.
+
+### Status LED Behavior
+- **During Setup:**  
+  The status LED blinks on and off every 500ms while the system is establishing a WiFi connection and synchronizing time.
+- **Post-Setup:**  
+  Once setup is complete, the LED flickers briefly each time a valid WebSocket message is received, signaling successful data fetches from the energy meter.
 
 ## Key Features
-- Monitors real-time Grid, Solar, and Consumer power.
-- Uses Shelly Pro 3EM's EM1 JSON API for data retrieval.
-- Provides an interactive web interface for historical data visualization.
-- Features an intuitive LED strip display for immediate energy status feedback.
+- Monitors real-time Grid, Solar, and Consumer power usage using Shelly Pro 3EM configured in monophase mode.
+- Visual feedback via an RGB LED strip that dynamically reflects energy consumption and source.
+- Web interface for real-time data display and historical energy usage visualization.
+- Status LED providing feedback during setup and data reception.
+- Robust WebSocket communication with ping/pong handling for maintaining connection with the Shelly device.
 
 ## Hardware Requirements
-- Espressif board (ESP32 or ESP8266 with code modifications).
-- Shelly Pro 3EM energy meter.
-- RGB LED strip.
+- **Microcontroller:** Espressif board (ESP32 recommended; ESP8266 with modifications possible).
+- **Energy Meter:** Shelly Pro 3EM energy meter configured in monophase mode.
+  - Use one CT clamp on the solar inverter feed-in.
+  - Use one CT clamp on the consumer feed.
+  - *Note:* Future code changes may enable monitoring of both Grid and Solar simultaneously.
+- **LED Strip:** RGB LED strip compatible with the Adafruit NeoPixel library (adjust configuration for GRBW if needed).
+- **Status LED (Optional):** WS2812B LED or a standard PWM LED for status indication.
 
 ## Software Dependencies
-- ArduinoJson (v6.19.1 or later)
-- Adafruit NeoPixel (v1.10.1 or later)
-- EEPROM
+- ArduinoJson (v6.17.0 or later)
+- Adafruit NeoPixel (v1.10.0 or later)
+- ArduinoWebsockets
+- ESP32Ping
+- SPIFFS (for file storage and configuration)
 
 ## Configuration and Setup
-1. Input WiFi credentials and Shelly device IP in the `main.cpp` file for initial setup.
-2. Use Platform.io in VSCode to upload the code to the Espressif board.
-3. Connect the Shelly Pro 3EM energy meter and the LED strip following the project guidelines.
+1. **Hardware Setup:**  
+   - Connect the LED strip data line to the designated GPIO pin on the ESP32 (default is GPIO4).
+   - Ensure proper power supply and ground connections for the LED strip and microcontroller.
+   - Configure the Shelly Pro 3EM energy meter to run in monophase mode with one CT clamp on the solar inverter feed-in and one on the consumer feed.
+   - Connect the Shelly Pro 3EM energy meter to the network and ensure it is accessible.
 
-## Usage Instructions
-Access the web interface through the Espressif board's IP to view energy usage over time. The LED Strip provides real-time visual feedback on energy sources and usage. Modify WiFi credentials and Shelly device IP via the web configuration page.
+2. **Software Configuration:**  
+   - Configure WiFi credentials, Shelly device IP, and other parameters via the web configuration page after initial setup.
+   - Use PlatformIO in VSCode to build and upload the code to the ESP32 board.
+   - The code automatically manages WiFi connection, time synchronization, WebSocket communication, and LED display updates.
 
-### Status LED Indication
-This project optionally includes a status LED for additional feedback on the system's operation. It can be configured as a WS2812B LED or a regular PWM LED on GPIO8, controlled by the `USE_WS2812B_FOR_STATUS` define switch in the code.
+3. **Running the Device:**  
+   - On boot, the status LED will blink while connecting to WiFi and synchronizing time.
+   - After setup, the LED strip displays real‑time energy metrics.
+   - The status LED flickers briefly when new data is successfully fetched from the Shelly device.
 
-#### Status LED Define Switch
-To use a WS2812B LED for status indications, uncomment the line `#define USE_WS2812B_FOR_STATUS`. To use a regular PWM LED connected to GPIO8, keep this line commented out.
-
-#### Status LED Lights and Meanings
-| Color/Blink Pattern | Meaning |
-|---------------------|---------|
-| Solid Orange (WS2812B) / Rapid Blink (PWM) | Attempting to connect to WiFi |
-| Solid Yellow (WS2812B) / Multiple Rapid Blinks (PWM) | Clearing EEPROM |
-| Solid Green (WS2812B) / Solid On (PWM) | Successfully connected to WiFi |
-| Blink Green (WS2812B) / Series of Blinks (PWM) | Data successfully fetched from the energy meter |
-
-## Future Enhancements
-- OTA (Over-The-Air) firmware updates for easy software maintenance.
-- Comprehensive configuration web page to simplify device setup and customization.
-- Improved EEPROM handling for more reliable data storage.
-- More flexible configuration options for Status LED and Indicator LED strip, including customizable colors and patterns.
-- Daily status email feature to provide a summary of energy usage and system status.
-- Integration with home automation systems for more sophisticated energy management.
-- Enhanced security features to protect device configuration and data.
-- Adaptive brightness for the LED strip based on ambient light conditions.
-
-## Beta Version Disclaimer
-This beta version is subject to significant enhancements, especially in configuration handling and chart functionalities.
+## Web Interface
+Access the device's web interface via its IP address on your network to:
+- View real‑time energy usage and historical data charts.
+- Configure WiFi settings and Shelly device details.
+- Monitor system status and adjust settings as needed.
 
 ## Troubleshooting and Common Issues
-- Verify correct hardware setup; incorrect wiring or configurations may cause malfunctions.
-- Resolve WiFi or connectivity issues by updating the WiFi credentials and Shelly device IP on the configuration page.
+- **LED Strip Not Displaying:**  
+  Verify correct LED strip type (RGB vs. GRBW), wiring, power supply, and configuration in the code (ensure the correct pin and LED type flags are set).
+- **No LED Activity:**  
+  Check that the LED pin is defined correctly and that the LED strip is receiving power and data signals.
+- **WiFi/Connection Issues:**  
+  Confirm WiFi credentials, network connectivity, and proper configuration via the web page.
+- **WebSocket Communication:**  
+  Ensure the Shelly device is reachable at the specified IP and that the WebSocket endpoint is correct. Check serial logs for errors in connecting or maintaining the WebSocket.
+- **LED Status Behavior:**  
+  During setup, watch for blinking on the status LED. After setup, observe brief flickers on receiving WebSocket messages as an indication of data updates.
+
+## Future Roadmap
+- **Multiple Shelly EM Units:**  
+  Future enhancements may support using multiple individual Shelly EM devices instead of a single Shelly Pro 3EM running in monophase mode. This would allow finer granularity of monitoring across different circuits.
+- **Frequency Slider and Downsampling:**  
+  Implement a slider for adjusting update frequency and corresponding downsampling of historical data.
+- **OTA Firmware Updates:**  
+  Over-The-Air updates for easier maintenance.
+- **Enhanced Configuration Interface:**  
+  Comprehensive web-based configuration for easier setup and customization.
+- **Adaptive Brightness and Additional Features:**  
+  Adjust LED brightness based on ambient light, daily email summaries, integration with home automation systems, enhanced security, and more.
 
 ## License and Contributions
-This open-source project welcomes contributions to improve functionality and usability.
+This open-source project welcomes contributions to improve functionality and usability. Please refer to the project's license for usage and distribution terms.
