@@ -6,19 +6,14 @@
 #include <SPIFFS.h>
 #include <ArduinoWebsockets.h>
 #include <esp_task_wdt.h>
-#include <ESP32Ping.h> // For ping functionality
+#include <ESP32Ping.h>
 #include <map>
-#include <vector> // For dynamic device storage
+#include <vector>
 #include "includes.h"
 
 using namespace websockets;
 
-#define DEBUG_LOG 0            // Enable debug logging
-#define DISABLE_PERIODIC_RPC 0 // Disable periodic RPC requests after initial connection
-
-// Timestamp function to return formatted time string
-String timestamp()
-{
+String timestamp() {
     unsigned long ms = millis();
     unsigned long days = ms / 86400000UL;
     ms %= 86400000UL;
@@ -33,19 +28,8 @@ String timestamp()
     return String(buf);
 }
 
-// Macros for printing with timestamp
-#define TIMED_PRINT(x)             \
-    {                              \
-        Serial.print(timestamp()); \
-        Serial.print(" ");         \
-        Serial.print(x);           \
-    }
-#define TIMED_PRINTLN(x)           \
-    {                              \
-        Serial.print(timestamp()); \
-        Serial.print(" ");         \
-        Serial.println(x);         \
-    }
+#define TIMED_PRINT(x) { Serial.print(timestamp()); Serial.print(" "); Serial.print(x); }
+#define TIMED_PRINTLN(x) { Serial.print(timestamp()); Serial.print(" "); Serial.println(x); }
 
 #define MAX_BRIGHTNESS 255
 int globalBrightness = 32;
@@ -63,58 +47,60 @@ Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRBW + NEO_KHZ800);
 Adafruit_NeoPixel statusLED(LED_STATUS_COUNT, LED_STATUS_PIN, NEO_GRB + NEO_KHZ800);
 #endif
 
-// Default WiFi and Shelly configuration
-const char *defaultSSID = "";
-const char *defaultPassword = "";
-const char *defaultShellyIP = "";
+unsigned long lastWebSocketAttempt = 0;
+const long webSocketRetryInterval = 10000; // 10 seconds
 
-// Shemeter Name and dynamic Fallback AP credentials
-String ShemeterName = "SheMeter";
+bool inSetup = true;  // Flag to indicate setup phase
+bool rpcInProgress = false;
+bool newDataAvailable = false;
+uint64_t deviceStartTimeMillis = 0;
+
+const char* defaultSSID = "";
+const char* defaultPassword = "";
+const char* defaultShellyIP = "";
+
+String ShemeterName = "SheMonitor";
 String fallbackSSID = ShemeterName + "AP";
-const char *fallbackPWD = "12345678";
+const char* fallbackPWD = "12345678";
 
 char ssid[32] = "";
 char password[64] = "";
 char shellyIP[16] = "";
 
-// Timing and State Variables
 unsigned long previousMillis = 0;
-const long dataUpdateInterval = 1000;
+const long dataUpdateInterval = 1000; // 1-second update frequency
 const long loopDelay = 2;
-bool newDataAvailable = false;
 unsigned long lastDataUpdateTime = 0;
-int calculatedValue = 0; // Placeholder if needed
+int calculatedValue = 0;
 
-// Energy Meter Structure with embedded lastUpdateTime
-struct EnergyMeter
-{
-    String name;
-    int act_power;
-    unsigned long lastUpdateTime;
+struct EnergyMeter { String name; int act_power; unsigned long lastUpdateTime; };
+EnergyMeter meters[3] = { {"Grid", 0, 0}, {"Solar", 0, 0}, {"Consumer", 0, 0} };
+
+struct DataPoint {
+    uint64_t timestamp;  
+    int grid;
+    int solar;
+    int consumer;
 };
-EnergyMeter meters[3] = {
-    {"Grid", 0, 0},
-    {"Solar", 0, 0},
-    {"Consumer", 0, 0}};
 
-// Web Server and WebSocket Client
+const int HISTORY_SIZE = 300;
+DataPoint history[HISTORY_SIZE];
+int historyIndex = 0;
+
 WebServer server(80);
 WebsocketsClient wsClient;
 
-// Configuration Path
-const char *configPath = "/config.json";
+const char* configPath = "/config.json";
 
-// Pending Requests Map
-struct PendingRequest
-{
-    std::function<void(JsonObject &)> callback;
-};
+struct PendingRequest { std::function<void(JsonObject&)> callback; };
 std::map<int, PendingRequest> pendingRequests;
 int commandId = 0;
 
-// Function Prototypes
+static StaticJsonDocument<20480> historyJsonDoc;
+
+bool startUniqueMDNS(String& name);
 void blinkPWMLED(uint8_t pin, unsigned long interval, int blinks);
-bool tryConnectWiFi(const char *ssid, const char *password);
+bool tryConnectWiFi(const char* ssid, const char* password);
 int scaledBrightness(int brightness);
 int scaledBrightness();
 void displayMetricsOnStrip();
@@ -126,85 +112,77 @@ void handleConfig();
 void setupWebServer();
 void checkWiFiConnection();
 void updateEnergyMeterData();
-int sendRequest(const char *method, JsonVariant params, std::function<void(JsonObject &)> callback);
+int sendRequest(const char* method, JsonVariant params, std::function<void(JsonObject&)> callback);
 void onMessageCallback(WebsocketsMessage message);
 void handleWebSocketEvent(WebsocketsEvent event, String data);
-void sendEM1GetStatusRequests();
-void ensureWiFiConnected();
+void sendShellyGetStatus();
 void checkAndEstablishWebSocket();
-bool isValidShellyHostname(const String &host);
-bool isValidShellyIP(const char *ip);
+bool isValidShellyHostname(const String& host);
+bool isValidShellyIP(const char* ip);
 void updateMeterActPower(int meterIndex, int newPower);
+void storeDataPoint();
+void handleHistory();
+void loadHistory();
+void setInitialTimeRange();
 
-// Function Implementations
-
-bool isValidShellyHostname(const String &host)
-{
-    String lowerHost = host;
-    lowerHost.toLowerCase();
-    return lowerHost.startsWith("shelly") && host.indexOf('-') != -1;
-}
-
-bool isValidShellyIP(const char *ip)
-{
-    String ipStr = String(ip);
-    return ipStr.length() > 0 && ipStr != "xxx";
-}
-
-void blinkPWMLED(uint8_t pin, unsigned long interval, int blinks)
-{
+// Utility Functions for LED Control
+void blinkPWMLED(uint8_t pin, unsigned long interval, int blinks) {
     static unsigned long lastBlinkTime = 0;
     static int blinkCount = 0;
     static bool ledState = false;
     unsigned long currentMillis = millis();
-    if (blinkCount < blinks * 2)
-    {
-        if (currentMillis - lastBlinkTime >= interval)
-        {
+    if (blinkCount < blinks * 2) {
+        if (currentMillis - lastBlinkTime >= interval) {
             lastBlinkTime = currentMillis;
             ledState = !ledState;
             digitalWrite(pin, ledState ? HIGH : LOW);
-            if (!ledState)
-                blinkCount++;
+            if (!ledState) blinkCount++;
         }
-    }
-    else
-    {
+    } else {
         blinkCount = 0;
         digitalWrite(pin, LOW);
     }
 }
 
-bool tryConnectWiFi(const char *ssid, const char *password)
-{
+void flickStatusLED() {
+    digitalWrite(LED_STATUS_PIN, HIGH);
+    delay(100);
+    digitalWrite(LED_STATUS_PIN, LOW);
+}
+
+bool isValidShellyHostname(const String& host) {
+    String lowerHost = host;
+    lowerHost.toLowerCase();
+    return lowerHost.startsWith("shelly") && host.indexOf('-') != -1;
+}
+
+bool isValidShellyIP(const char* ip) {
+    String ipStr = String(ip);
+    return ipStr.length() > 0 && ipStr != "xxx";
+}
+
+bool tryConnectWiFi(const char* ssid, const char* password) {
     WiFi.disconnect();
     WiFi.begin(ssid, password);
     unsigned long startTime = millis();
     TIMED_PRINT("Connecting to WiFi");
-    while (WiFi.status() != WL_CONNECTED && millis() - startTime < 10000)
-    {
+    while (WiFi.status() != WL_CONNECTED && millis() - startTime < 10000) {
         delay(500);
         Serial.print(".");
     }
-    if (WiFi.status() == WL_CONNECTED)
-    {
+    if (WiFi.status() == WL_CONNECTED) {
         TIMED_PRINTLN("WiFi Connected!");
         TIMED_PRINTLN("IP Address: " + String(WiFi.localIP()));
         return true;
-    }
-    else
-    {
+    } else {
         TIMED_PRINTLN("Failed to connect to WiFi.");
         return false;
     }
 }
 
-int scaledBrightness(int brightness)
-{
-    if (brightness <= 0)
-        return 0;
-    if (brightness >= MAX_BRIGHTNESS)
-        return MAX_BRIGHTNESS;
+int scaledBrightness(int brightness) {
+    if (brightness <= 0) return 0;
+    if (brightness >= MAX_BRIGHTNESS) return MAX_BRIGHTNESS;
     float scale = (float)globalBrightness / MAX_BRIGHTNESS;
     int newBrightness = (int)(brightness * scale);
     return newBrightness <= 0 ? 1 : min(newBrightness, MAX_BRIGHTNESS);
@@ -212,75 +190,67 @@ int scaledBrightness(int brightness)
 
 int scaledBrightness() { return scaledBrightness(globalBrightness); }
 
-void displayMetricsOnStrip()
-{
+void displayMetricsOnStrip() {
     int consumerValue = 0;
     int solarValue = 0;
 
-    // Dynamically identify meters based on their names
-    for (int i = 0; i < 3; i++)
-    {
-        if (meters[i].name.equalsIgnoreCase("Consumer"))
-        {
+    for (int i = 0; i < 3; i++) {
+        if (meters[i].name.equalsIgnoreCase("Consumer")) {
             consumerValue = meters[i].act_power;
-        }
-        else if (meters[i].name.equalsIgnoreCase("Solar"))
-        {
+        } else if (meters[i].name.equalsIgnoreCase("Solar")) {
             solarValue = meters[i].act_power;
         }
     }
 
-    for (int i = 0; i < LED_COUNT; i++)
-    {
-        int ledValue = map(i, 0, LED_COUNT - 1, 100, 5000);
-        if (ledValue <= consumerValue)
-        {
-            if (ledValue <= solarValue)
-            {
-                strip.setPixelColor(i, strip.Color(scaledBrightness(153), scaledBrightness(255), 0, 0));
-            }
-            else
-            {
-                strip.setPixelColor(i, strip.Color(scaledBrightness(255), 0, 0, 0));
-            }
-        }
-        else if (ledValue <= solarValue)
-        {
-            strip.setPixelColor(i, strip.Color(0, scaledBrightness(204), scaledBrightness(255), 0));
-        }
-        else
-        {
-            strip.setPixelColor(i, strip.Color(0, 0, 0, 0));
+    uint32_t colorBoth = strip.Color(scaledBrightness(153), scaledBrightness(255), 0, 0);
+    uint32_t colorConsumer = strip.Color(scaledBrightness(255), 0, 0, 0);
+    uint32_t colorSolar = strip.Color(0, scaledBrightness(204), scaledBrightness(255), 0);
+    uint32_t colorOff = strip.Color(0, 0, 0, 0);
+
+    int minRaw = 100;
+    int maxRaw = 5000;
+    int range = (maxRaw - minRaw);
+    int last = LED_COUNT - 1;
+
+    for (int i = 0; i < LED_COUNT; i++) {
+        int ledValue = minRaw + (range * i) / last;
+        if (ledValue <= consumerValue && ledValue <= solarValue) {
+            strip.setPixelColor(i, colorBoth);
+        } else if (ledValue <= consumerValue) {
+            strip.setPixelColor(i, colorConsumer);
+        } else if (ledValue <= solarValue) {
+            strip.setPixelColor(i, colorSolar);
+        } else {
+            strip.setPixelColor(i, colorOff);
         }
     }
     strip.show();
 }
 
-void handleRoot() { server.send_P(200, "text/html", index_html); }
+void handleRoot() {
+    server.send_P(200, "text/html", index_html);
+}
 
-void handleJson()
-{
+void handleJson() {
     unsigned long clientTimestamp = server.arg("timestamp").toInt();
-    String json = "[";
-    for (int i = 0; i < 3; i++)
-    {
-        if (i > 0)
-            json += ",";
+    String json = "{";
+    json += "\"SheMeterName\": \"" + ShemeterName + "\",";
+    json += "\"meters\": [";
+    for (int i = 0; i < 3; i++) {
+        if (i > 0) json += ",";
         json += "{\"name\":\"" + meters[i].name + "\",\"power\":" + String(meters[i].act_power) + "}";
     }
     json += "]";
+    json += "}";
     server.send(200, "application/json", json);
 }
 
-bool loadConfigSPIFFS()
-{
-    if (!SPIFFS.begin(true))
-    {
+bool loadConfigSPIFFS() {
+    if (!SPIFFS.begin(true)) {
         TIMED_PRINTLN("SPIFFS Mount Failed");
         return false;
     }
-    if (!SPIFFS.exists(configPath))
-    {
+    if (!SPIFFS.exists(configPath)) {
         TIMED_PRINTLN("Config file not found. Initializing default configuration.");
         strncpy(ssid, defaultSSID, sizeof(ssid) - 1);
         ssid[sizeof(ssid) - 1] = '\0';
@@ -291,61 +261,50 @@ bool loadConfigSPIFFS()
         meters[0].name = "Grid";
         meters[1].name = "Solar";
         meters[2].name = "Consumer";
-        ShemeterName = "SheMeter";
+        ShemeterName = "SheMonitor";
         saveConfigSPIFFS();
         return true;
     }
     File file = SPIFFS.open(configPath, "r");
-    if (!file)
-    {
+    if (!file) {
         TIMED_PRINTLN("Failed to open config file");
         return false;
     }
     StaticJsonDocument<512> doc;
     DeserializationError error = deserializeJson(doc, file);
     file.close();
-    if (error)
-    {
+    if (error) {
         TIMED_PRINTLN("Failed to parse config file");
         return false;
     }
-    const char *s = doc["ssid"];
-    const char *p = doc["password"];
-    const char *sp = doc["shellyIP"];
-    const char *sheName = doc["shemeterName"];
+    const char* s = doc["ssid"];
+    const char* p = doc["password"];
+    const char* sp = doc["shellyIP"];
+    const char* sheName = doc["shemeterName"];
     strncpy(ssid, s ? s : defaultSSID, sizeof(ssid) - 1);
     ssid[sizeof(ssid) - 1] = '\0';
     strncpy(password, p ? p : defaultPassword, sizeof(password) - 1);
     password[sizeof(password) - 1] = '\0';
     strncpy(shellyIP, sp ? sp : defaultShellyIP, sizeof(shellyIP) - 1);
     shellyIP[sizeof(shellyIP) - 1] = '\0';
-    ShemeterName = sheName ? String(sheName) : "SheMeter";
+    ShemeterName = sheName ? String(sheName) : "SheMonitor";
 
-    if (doc.containsKey("meters") && doc["meters"].is<JsonArray>())
-    {
+    if (doc.containsKey("meters") && doc["meters"].is<JsonArray>()) {
         JsonArray meterArray = doc["meters"].as<JsonArray>();
         int index = 0;
-        for (auto meterName : meterArray)
-        {
-            if (index < 3 && meterName.is<const char *>())
-            {
-                meters[index].name = String((const char *)meterName);
+        for (auto meterName : meterArray) {
+            if (index < 3 && meterName.is<const char*>()) {
+                meters[index].name = String((const char*)meterName);
                 index++;
             }
         }
-        while (index < 3)
-        {
-            if (index == 0)
-                meters[index].name = "Grid";
-            else if (index == 1)
-                meters[index].name = "Solar";
-            else
-                meters[index].name = "Consumer";
+        while (index < 3) {
+            if (index == 0) meters[index].name = "Grid";
+            else if (index == 1) meters[index].name = "Solar";
+            else meters[index].name = "Consumer";
             index++;
         }
-    }
-    else
-    {
+    } else {
         meters[0].name = "Grid";
         meters[1].name = "Solar";
         meters[2].name = "Consumer";
@@ -357,36 +316,30 @@ bool loadConfigSPIFFS()
     TIMED_PRINTLN("Shelly IP: " + String(shellyIP));
     TIMED_PRINTLN("SheMeter Name: " + ShemeterName);
     String meterNames = "Meter Names: ";
-    for (int i = 0; i < 3; i++)
-    {
+    for (int i = 0; i < 3; i++) {
         meterNames += meters[i].name;
-        if (i < 2)
-            meterNames += ", ";
+        if (i < 2) meterNames += ", ";
     }
     TIMED_PRINTLN(meterNames);
     return true;
 }
 
-bool saveConfigSPIFFS()
-{
+bool saveConfigSPIFFS() {
     StaticJsonDocument<512> doc;
     doc["ssid"] = ssid;
     doc["password"] = password;
     doc["shellyIP"] = shellyIP;
     doc["shemeterName"] = ShemeterName;
     JsonArray meterArray = doc.createNestedArray("meters");
-    for (int i = 0; i < 3; i++)
-    {
+    for (int i = 0; i < 3; i++) {
         meterArray.add(meters[i].name);
     }
     File file = SPIFFS.open(configPath, "w");
-    if (!file)
-    {
+    if (!file) {
         TIMED_PRINTLN("Failed to open config file for writing");
         return false;
     }
-    if (serializeJson(doc, file) == 0)
-    {
+    if (serializeJson(doc, file) == 0) {
         TIMED_PRINTLN("Failed to write to file");
         file.close();
         return false;
@@ -396,10 +349,8 @@ bool saveConfigSPIFFS()
     return true;
 }
 
-void handleConfig()
-{
-    if (server.method() == HTTP_POST)
-    {
+void handleConfig() {
+    if (server.method() == HTTP_POST) {
         String newSSID = server.arg("ssid");
         String newPassword = server.arg("password");
         String newShellyIP = server.arg("shellyIP");
@@ -411,33 +362,32 @@ void handleConfig()
         bool valid = true;
         String errorMsg = "";
 
-        // Validate meter roles
-        if (meter0Role != "Grid" && meter0Role != "Solar" && meter0Role != "Consumer")
-        {
+        if (meter0Role != "Grid" && meter0Role != "Solar" && meter0Role != "Consumer") {
             valid = false;
             errorMsg = "Invalid role selected for Meter 0.";
         }
-        if (meter1Role != "Grid" && meter1Role != "Solar" && meter1Role != "Consumer")
-        {
+        if (meter1Role != "Grid" && meter1Role != "Solar" && meter1Role != "Consumer") {
             valid = false;
             errorMsg = "Invalid role selected for Meter 1.";
         }
-        if (meter2Role != "Grid" && meter2Role != "Solar" && meter2Role != "Consumer")
-        {
+        if (meter2Role != "Grid" && meter2Role != "Solar" && meter2Role != "Consumer") {
             valid = false;
             errorMsg = "Invalid role selected for Meter 2.";
         }
-        if (valid)
-        {
-            if (meter0Role == meter1Role || meter0Role == meter2Role || meter1Role == meter2Role)
-            {
-                valid = false;
-                errorMsg = "Selected roles must be unique for each meter.";
-            }
+        if (valid && (meter0Role == meter1Role || meter0Role == meter2Role || meter1Role == meter2Role)) {
+            valid = false;
+            errorMsg = "Selected roles must be unique for each meter.";
         }
 
-        if (valid)
-        {
+        MDNS.end();
+        if (!MDNS.begin(newSheMeterName)) {
+            valid = false;
+            errorMsg = "The name " + newSheMeterName + " is already in use on the network. Please choose a different name.";
+        } else {
+            MDNS.end();
+        }
+
+        if (valid) {
             newSSID.toCharArray(ssid, sizeof(ssid));
             newPassword.toCharArray(password, sizeof(password));
             newShellyIP.toCharArray(shellyIP, sizeof(shellyIP));
@@ -448,13 +398,17 @@ void handleConfig()
             meters[1].name = meter1Role;
             meters[2].name = meter2Role;
 
+            if (startUniqueMDNS(ShemeterName)) {
+                TIMED_PRINTLN("mDNS responder restarted with new ShemeterName.");
+            } else {
+                TIMED_PRINTLN("Failed to restart mDNS responder with new ShemeterName.");
+            }
+
             saveConfigSPIFFS();
             TIMED_PRINTLN("Configuration updated via web interface.");
             server.sendHeader("Location", "/");
             server.send(303);
-        }
-        else
-        {
+        } else {
             String html = "<!DOCTYPE html><html><body>";
             html += "<h1>Configuration Error</h1>";
             html += "<p>" + errorMsg + "</p>";
@@ -462,9 +416,7 @@ void handleConfig()
             html += "</body></html>";
             server.send(400, "text/html", html);
         }
-    }
-    else
-    {
+    } else {
         String html = "<!DOCTYPE html><html><body>";
         html += "<h1>Configuration</h1>";
         html += "<form action='/config' method='post'>";
@@ -472,7 +424,7 @@ void handleConfig()
         html += "SSID: <input type='text' name='ssid' value='" + String(ssid) + "'><br>";
         html += "Password: <input type='password' name='password' value='" + String(password) + "'><br>";
         html += "Shelly IP: <input type='text' name='shellyIP' value='" + String(shellyIP) + "'><br>";
-        html += "SheMeter Name: <input type='text' name='shemeterName' value='" + ShemeterName + "'><br>";
+        html += "SheMeter Name: <input type='text' name='shemeterName' value='" + String(ShemeterName) + "'><br>";
 
         html += "Meter 0 Role: <select name='meter0'>";
         html += "<option value='Grid'" + String(meters[0].name.equalsIgnoreCase("Grid") ? " selected" : "") + ">Grid</option>";
@@ -497,65 +449,65 @@ void handleConfig()
 
         html += "<input type='submit' value='Save'>";
         html += "</form>";
+
+        html += "<form action='/factoryReset' method='post' style='margin-top:20px;'>";
+        html += "<input type='submit' value='Factory Reset'>";
+        html += "</form>";
+
         html += "</body></html>";
         server.send(200, "text/html", html);
     }
 }
 
-void setupWebServer()
-{
+void setupWebServer() {
     server.on("/", handleRoot);
     server.on("/data", handleJson);
     server.on("/config", handleConfig);
+    server.on("/history", HTTP_GET, handleHistory);
+    server.on("/factoryReset", HTTP_POST, []() {
+        SPIFFS.remove(configPath);
+        TIMED_PRINTLN("Factory reset performed. Configuration cleared.");
+        server.sendHeader("Location", "/config");
+        server.send(303);
+    });
     server.begin();
     TIMED_PRINTLN("HTTP server started");
 }
 
-void checkWiFiConnection()
-{
-    if (WiFi.status() != WL_CONNECTED)
-    {
+void checkWiFiConnection() {
+    if (WiFi.status() != WL_CONNECTED) {
         TIMED_PRINTLN("WiFi connection lost. Attempting to reconnect...");
-        if (tryConnectWiFi(ssid, password))
-        {
+        if (tryConnectWiFi(ssid, password)) {
             TIMED_PRINTLN("WiFi reconnected.");
-        }
-        else
-        {
+        } else {
             TIMED_PRINTLN("Reconnection failed.");
         }
     }
 }
 
-int sendRequest(const char *method, JsonVariant params, std::function<void(JsonObject &)> callback)
-{
+int sendRequest(const char* method, JsonVariant params, std::function<void(JsonObject&)> callback) {
     commandId++;
     StaticJsonDocument<256> doc;
     doc["jsonrpc"] = "2.0";
     doc["id"] = commandId;
     doc["src"] = "arduino_client";
     doc["method"] = method;
-    if (!params.isNull())
-    {
+    if (!params.isNull()) {
         doc["params"] = params;
     }
     String request;
     serializeJson(doc, request);
     TIMED_PRINTLN("Sending RPC Request (ID: " + String(commandId) + "): " + request);
-    pendingRequests[commandId] = {callback};
+    pendingRequests[commandId] = { callback };
     wsClient.send(request);
     return commandId;
 }
 
-void updateMeterActPower(int meterIndex, int newPower)
-{
-    // Invert sign for Solar meter
-    if (meters[meterIndex].name.equalsIgnoreCase("Solar"))
-    {
+void updateMeterActPower(int meterIndex, int newPower) {
+    if (meters[meterIndex].name.equalsIgnoreCase("Solar")) {
         newPower = -newPower;
     }
-    if (meters[meterIndex].act_power != newPower)
-    {
+    if (meters[meterIndex].act_power != newPower) {
         meters[meterIndex].act_power = newPower;
         meters[meterIndex].lastUpdateTime = millis();
         newDataAvailable = true;
@@ -563,85 +515,148 @@ void updateMeterActPower(int meterIndex, int newPower)
     }
 }
 
-void onMessageCallback(WebsocketsMessage message)
-{
-    TIMED_PRINTLN("Received WebSocket message:");
-    TIMED_PRINTLN(message.data());
-    StaticJsonDocument<1024> doc;
-    DeserializationError error = deserializeJson(doc, message.data());
-    if (error)
-    {
-        TIMED_PRINTLN(String("Failed to parse response: ") + error.f_str());
+void sendShellyGetStatus() {
+    if (rpcInProgress) return;
+    rpcInProgress = true;
+    sendRequest("Shelly.GetStatus", JsonVariant(), [](JsonObject& response) {
+        TIMED_PRINTLN("Shelly.GetStatus response received.");
+        rpcInProgress = false;
+
+        JsonObject result = response["result"].as<JsonObject>();
+        for (int i = 0; i < 3; ++i) {
+            String key = "em1:" + String(i);
+            if (result.containsKey(key)) {
+                JsonObject meter = result[key].as<JsonObject>();
+                if (meter.containsKey("act_power")) {
+                    int newPower = meter["act_power"].as<int>();
+                    updateMeterActPower(i, newPower);
+                    TIMED_PRINTLN("Meter " + String(i) + " Updated: " + String(newPower) + "W");
+                }
+            } else {
+                TIMED_PRINTLN("Key not found in response: " + key);
+            }
+        }
+        storeDataPoint();
+    });
+}
+
+void updateEnergyMeterData() {
+    if (!wsClient.available()) {
+        TIMED_PRINTLN("WebSocket unavailable during update.");
         return;
     }
-    if (doc.containsKey("id"))
-    {
+    sendShellyGetStatus();
+}
+
+void storeDataPoint() {
+    DataPoint dp;
+    time_t now = time(nullptr);
+    dp.timestamp = ((uint64_t) now) * 1000;
+    for (int i = 0; i < 3; i++) {
+        if (meters[i].name.equalsIgnoreCase("Grid")) {
+            dp.grid = meters[i].act_power;
+        } else if (meters[i].name.equalsIgnoreCase("Solar")) {
+            dp.solar = meters[i].act_power;
+        } else if (meters[i].name.equalsIgnoreCase("Consumer")) {
+            dp.consumer = meters[i].act_power;
+        }
+    }
+    history[historyIndex] = dp;
+    historyIndex = (historyIndex + 1) % HISTORY_SIZE;
+}
+
+void handleHistory() {
+    historyJsonDoc.clear();
+    JsonArray array = historyJsonDoc.to<JsonArray>();
+
+    int index = historyIndex;
+    for (int count = 0; count < HISTORY_SIZE; count++) {
+        DataPoint &dp = history[index];
+        if (dp.timestamp == 0) {
+            index = (index + 1) % HISTORY_SIZE;
+            continue;
+        }
+
+        time_t seconds = (time_t)(dp.timestamp / 1000);
+        int milliseconds = dp.timestamp % 1000;
+        struct tm *timeinfo = localtime(&seconds);
+        char timestampStr[20];
+        strftime(timestampStr, sizeof(timestampStr), "%Y%m%dT%H%M%S", timeinfo);
+        char fullTimestamp[24];
+        sprintf(fullTimestamp, "%s%03d", timestampStr, milliseconds);
+
+        JsonObject obj = array.createNestedObject();
+        obj["timestamp"] = String(fullTimestamp);
+        obj["Grid"] = dp.grid;
+        obj["Solar"] = dp.solar;
+        obj["Consumer"] = dp.consumer;
+
+        index = (index + 1) % HISTORY_SIZE;
+    }
+
+    String response;
+    serializeJson(array, response);
+    server.send(200, "application/json", response);
+}
+
+void onMessageCallback(WebsocketsMessage message) {
+    TIMED_PRINTLN("Received WebSocket message:");
+    TIMED_PRINTLN(message.data());
+
+    static StaticJsonDocument<2048> doc;
+    doc.clear();
+
+    DeserializationError error = deserializeJson(doc, message.data());
+    if (error) {
+        TIMED_PRINTLN(String("Failed to parse response: ") + error.f_str());
+        rpcInProgress = false;
+        return;
+    }
+
+    if (doc.containsKey("method")) {
+        String method = doc["method"];
+        if (method == "NotifyStatus") {
+            JsonObject params = doc["params"].as<JsonObject>();
+            for (int i = 0; i < 3; ++i) {
+                String key = "em1:" + String(i);
+                if (params.containsKey(key)) {
+                    JsonObject meter = params[key].as<JsonObject>();
+                    float act_power = meter["act_power"] | 0.0;
+                    updateMeterActPower(i, (int)act_power);
+                    Serial.print("Notification - Meter ");
+                    Serial.print(i);
+                    Serial.print(" Active Power: ");
+                    Serial.println(act_power);
+                }
+            }
+            storeDataPoint();
+        }
+    } else if (doc.containsKey("id")) {
         int id = doc["id"];
-        if (pendingRequests.find(id) != pendingRequests.end())
-        {
+        if (pendingRequests.find(id) != pendingRequests.end()) {
             JsonObject response = doc.as<JsonObject>();
             pendingRequests[id].callback(response);
             pendingRequests.erase(id);
-            return;
         }
     }
-    if (doc.containsKey("method"))
-    {
-        String method = doc["method"];
-        if (method == "NotifyStatus" || method == "NotifyFullStatus")
-        {
-            TIMED_PRINTLN("Received Notification:");
-            JsonObject params = doc["params"].as<JsonObject>();
-            bool anyUpdate = false;
-            for (int j = 0; j < 3; j++)
-            {
-                String key = "em1:" + String(j);
-                if (params.containsKey(key))
-                {
-                    JsonObject obj = params[key].as<JsonObject>();
-                    if (obj.containsKey("act_power"))
-                    {
-                        int newPower = obj["act_power"].as<int>();
-                        int oldPower = meters[j].act_power;
-                        updateMeterActPower(j, newPower);
-                        if (meters[j].act_power != oldPower)
-                        {
-                            anyUpdate = true;
-                        }
-                    }
-                }
-            }
-            if (anyUpdate)
-            {
-                lastDataUpdateTime = millis();
-            }
-        }
-        else if (method == "NotifyEvent")
-        {
-            // Ignore NotifyEvent frames.
-        }
-    }
-    else
-    {
-        TIMED_PRINTLN("Received unsolicited message:");
-        serializeJsonPretty(doc, Serial);
-        Serial.println();
+
+    if (!inSetup) {
+        flickStatusLED();
     }
 }
 
-void handleWebSocketEvent(WebsocketsEvent event, String data)
-{
-    switch (event)
-    {
+void handleWebSocketEvent(WebsocketsEvent event, String data) {
+    switch (event) {
     case WebsocketsEvent::ConnectionOpened:
         TIMED_PRINTLN("WebSocket connection opened.");
         break;
     case WebsocketsEvent::ConnectionClosed:
         TIMED_PRINTLN("WebSocket connection closed.");
+        rpcInProgress = false;
         break;
     case WebsocketsEvent::GotPing:
-        TIMED_PRINTLN("WebSocket ping received.");
-        wsClient.pong(); // Respond with pong
+        TIMED_PRINTLN("WebSocket ping received. Replied Pong.");
+        wsClient.pong();
         break;
     case WebsocketsEvent::GotPong:
         TIMED_PRINTLN("WebSocket pong received.");
@@ -649,109 +664,72 @@ void handleWebSocketEvent(WebsocketsEvent event, String data)
     }
 }
 
-void sendEM1GetStatusRequests()
-{
-    for (int i = 0; i < 3; i++)
-    {
-        if (millis() - meters[i].lastUpdateTime > 2000)
-        {
-            StaticJsonDocument<64> params;
-            params["id"] = i;
-            sendRequest("EM1.GetStatus", params.as<JsonVariant>(), [i](JsonObject &response)
-                        {
-                if (response.containsKey("result")) {
-                    JsonObject result = response["result"];
-                    TIMED_PRINTLN("EM1.GetStatus Response for Meter ID " + String(i));
-                    if(result.containsKey("act_power")) {
-                        int newPower = result["act_power"].as<int>();
-                        updateMeterActPower(i, newPower);
-                        TIMED_PRINTLN("Active Power: " + String(meters[i].act_power) + " W");
-                    }
-                } else if (response.containsKey("error")) {
-                    JsonObject error = response["error"];
-                    TIMED_PRINTLN("Error in EM1.GetStatus response for Meter ID " + String(i));
-                    TIMED_PRINTLN("Code: " + String(error["code"].as<int>()));
-                    TIMED_PRINTLN("Message: " + String(error["message"].as<const char*>()));
-                } else {
-                    TIMED_PRINTLN("Unexpected EM1.GetStatus response:");
-                    serializeJsonPretty(response, Serial);
-                    Serial.println();
-                } });
+bool startUniqueMDNS(String& name) {
+    int suffix = 0;
+    bool started = false;
+    String baseName = name;
+    while (!started && suffix < 100) {
+        String uniqueName = baseName;
+        if (suffix > 0) {
+            uniqueName += String(suffix);
+        }
+        if (MDNS.begin(uniqueName)) {
+            name = uniqueName;
+            TIMED_PRINTLN("mDNS responder started as " + uniqueName + ".local");
+            saveConfigSPIFFS();
+            started = true;
+        } else {
+            TIMED_PRINTLN("mDNS name " + uniqueName + " is already in use. Trying " + String(suffix + 1));
+            suffix++;
         }
     }
+    if (!started) {
+        TIMED_PRINTLN("Failed to start mDNS responder with a unique name after " + String(suffix) + " attempts.");
+    }
+    return started;
 }
 
-void updateEnergyMeterData()
-{
-    if (!wsClient.available())
-    {
-        TIMED_PRINTLN("WebSocket unavailable during update.");
+void checkAndEstablishWebSocket() {
+    unsigned long now = millis();
+    if (now - lastWebSocketAttempt < webSocketRetryInterval) {
         return;
     }
-    sendEM1GetStatusRequests();
-}
+    lastWebSocketAttempt = now;
 
-void ensureWiFiConnected()
-{
-    if (WiFi.status() != WL_CONNECTED)
-    {
-        TIMED_PRINTLN("WiFi connection lost. Attempting to reconnect...");
-        if (tryConnectWiFi(ssid, password))
-        {
-            TIMED_PRINTLN("WiFi reconnected.");
-        }
-        else
-        {
-            TIMED_PRINTLN("Reconnection failed.");
-        }
-    }
-}
-
-void checkAndEstablishWebSocket()
-{
-    ensureWiFiConnected();
+    checkWiFiConnection();
     IPAddress storedIP;
     bool validStored = false;
-    if (String(shellyIP).length() > 0 && isValidShellyIP(shellyIP))
-    {
+    if (String(shellyIP).length() > 0 && isValidShellyIP(shellyIP)) {
         storedIP.fromString(shellyIP);
-        if (Ping.ping(storedIP))
-        {
+        if (Ping.ping(storedIP)) {
             validStored = true;
             TIMED_PRINTLN("Stored Shelly IP is reachable.");
-        }
-        else
-        {
+        } else {
             TIMED_PRINTLN("Stored Shelly IP is not reachable.");
         }
     }
-    if (validStored)
-    {
+    if (validStored) {
         String wsUrl = String("ws://") + shellyIP + "/rpc";
         TIMED_PRINT("Attempting to reconnect to WebSocket at: " + wsUrl);
         Serial.println();
-        if (wsClient.connect(wsUrl))
-        {
+        delay(500);
+        if (wsClient.connect(wsUrl)) {
             TIMED_PRINTLN("Reconnected to WebSocket using stored Shelly IP.");
-            sendEM1GetStatusRequests();
+            sendShellyGetStatus();
             return;
-        }
-        else
-        {
+        } else {
             TIMED_PRINTLN("Failed to reconnect using stored Shelly IP.");
         }
     }
 
-    delay(2000); // Stabilize network before mDNS
-
+    delay(2000);
     TIMED_PRINTLN("Attempting Shelly discovery via mDNS...");
 
 #if DEBUG_LOG
     int nAll = MDNS.queryService("http", "tcp");
     Serial.print(timestamp() + " All mDNS services discovered: ");
     Serial.println(nAll);
-    for (int j = 0; j < nAll; j++)
-    {
+    for (int j = 0; j < nAll; j++) {
         Serial.print(timestamp() + " Hostname: ");
         Serial.print(MDNS.hostname(j));
         Serial.print(" IP: ");
@@ -763,14 +741,15 @@ void checkAndEstablishWebSocket()
     TIMED_PRINT("mDNS query found ");
     Serial.println(nServices);
     Serial.println("Matching Shelly devices:");
-    std::vector<std::pair<String, IPAddress>> discoveredDevices;
-    for (int i = 0; i < nServices; ++i)
-    {
+
+    struct ShellyDevice { String name; IPAddress ip; };
+    std::vector<ShellyDevice> discoveredDevices;
+
+    for (int i = 0; i < nServices; ++i) {
         String host = MDNS.hostname(i);
-        if (isValidShellyHostname(host))
-        {
+        if (isValidShellyHostname(host)) {
             IPAddress ip = MDNS.IP(i);
-            discoveredDevices.push_back(std::make_pair(host, ip));
+            discoveredDevices.push_back({ host, ip });
             Serial.print("  ");
             Serial.print(host);
             Serial.print(" at ");
@@ -779,51 +758,38 @@ void checkAndEstablishWebSocket()
     }
 
     int validIndex = -1;
-    for (size_t i = 0; i < discoveredDevices.size(); i++)
-    {
-        if (Ping.ping(discoveredDevices[i].second))
-        {
+    for (size_t i = 0; i < discoveredDevices.size(); i++) {
+        if (Ping.ping(discoveredDevices[i].ip)) {
             validIndex = i;
             break;
         }
     }
-    if (validIndex != -1)
-    {
-        discoveredDevices[validIndex].second.toString().toCharArray(shellyIP, sizeof(shellyIP));
-        TIMED_PRINT("Using discovered Shelly device: " + discoveredDevices[validIndex].first + " at " + String(shellyIP));
+    if (validIndex != -1) {
+        discoveredDevices[validIndex].ip.toString().toCharArray(shellyIP, sizeof(shellyIP));
+        TIMED_PRINT("Using discovered Shelly device: " + discoveredDevices[validIndex].name + " at " + String(shellyIP));
         Serial.println();
-        if (discoveredDevices.size() == 1)
-        {
+        if (discoveredDevices.size() == 1) {
             TIMED_PRINTLN("Only one valid Shelly device found. Saving as default in config.");
             saveConfigSPIFFS();
         }
-    }
-    else
-    {
+    } else {
         TIMED_PRINTLN("No valid Shelly device found via mDNS.");
         return;
     }
     String wsUrl = String("ws://") + shellyIP + "/rpc";
     TIMED_PRINT("Connecting to WebSocket at: " + wsUrl);
     Serial.println();
-    if (wsClient.connect(wsUrl))
-    {
+    if (wsClient.connect(wsUrl)) {
         TIMED_PRINTLN("Connected to Shelly WebSocket after discovery.");
-        sendEM1GetStatusRequests();
-    }
-    else
-    {
+        sendShellyGetStatus();
+    } else {
         TIMED_PRINTLN("Failed to connect to Shelly WebSocket after discovery.");
     }
 }
 
-void setup()
-{
+void setup() {
     Serial.begin(115200);
-    while (!Serial)
-    {
-        ;
-    }
+    while (!Serial) { ; }
 
     esp_task_wdt_init(60, true);
     esp_task_wdt_add(NULL);
@@ -841,8 +807,7 @@ void setup()
     digitalWrite(LED_STATUS_PIN, LOW);
 #endif
 
-    delay(2000);
-
+    delay(5000);
     loadConfigSPIFFS();
 
     TIMED_PRINTLN("Attempting to connect using stored WiFi credentials...");
@@ -850,118 +815,99 @@ void setup()
     WiFi.begin(ssid, password);
     delay(3500);
 
-    if (WiFi.status() != WL_CONNECTED)
-    {
+    if (WiFi.status() != WL_CONNECTED) {
         TIMED_PRINTLN("Stored WiFi credentials failed. Starting SmartConfig...");
         WiFi.mode(WIFI_AP_STA);
         WiFi.beginSmartConfig();
         unsigned long smartconfigStart = millis();
-        while (!WiFi.smartConfigDone() && (millis() - smartconfigStart) < 300000)
-        {
+        while (!WiFi.smartConfigDone() && (millis() - smartconfigStart) < 300000) {
             delay(500);
             esp_task_wdt_reset();
             Serial.print(".");
         }
-        if (WiFi.smartConfigDone())
-        {
+        if (WiFi.smartConfigDone()) {
             TIMED_PRINTLN("SmartConfig successful.");
-            while (WiFi.status() != WL_CONNECTED)
-            {
+            while (WiFi.status() != WL_CONNECTED) {
                 delay(500);
                 esp_task_wdt_reset();
                 Serial.print(".");
             }
             TIMED_PRINTLN("WiFi Connected.");
-            TIMED_PRINT("IP Address: ");
-            TIMED_PRINTLN(WiFi.localIP());
+            TIMED_PRINTLN(String("IP: ") + WiFi.localIP().toString());
             strncpy(ssid, WiFi.SSID().c_str(), sizeof(ssid) - 1);
             ssid[sizeof(ssid) - 1] = '\0';
             strncpy(password, WiFi.psk().c_str(), sizeof(password) - 1);
             password[sizeof(password) - 1] = '\0';
             saveConfigSPIFFS();
-        }
-        else
-        {
+        } else {
             TIMED_PRINTLN("SmartConfig failed. Starting fallback AP mode.");
             WiFi.mode(WIFI_AP);
             WiFi.softAP(fallbackSSID.c_str(), fallbackPWD);
         }
-    }
-    else
-    {
+    } else {
         TIMED_PRINTLN("WiFi Connected using stored credentials.");
     }
 
-    if (WiFi.status() == WL_CONNECTED)
-    {
+    if (WiFi.status() == WL_CONNECTED) {
         TIMED_PRINTLN("Connected to WiFi");
-        TIMED_PRINT("IP: " + String(WiFi.localIP()));
+        TIMED_PRINT(String("IP: ") + String(WiFi.localIP().toString()));
 
-        delay(2000); // Delay for network stabilization
-
-        if (MDNS.begin("SheMeter"))
-        {
-            TIMED_PRINTLN("mDNS responder started as SheMeter.local");
+        configTime(36000, 0, "au.pool.ntp.org");
+        struct tm timeinfo;
+        while (!getLocalTime(&timeinfo)) {
+            TIMED_PRINTLN("Waiting for time sync...");
+            delay(1000);
         }
-        else
-        {
-            TIMED_PRINTLN("Error setting up mDNS responder!");
+        deviceStartTimeMillis = ((uint64_t)mktime(&timeinfo)) * 1000 + millis();
+        TIMED_PRINTLN("Device start time initialized: " + String(mktime(&timeinfo)));
+
+        inSetup = false;  // End setup phase
+
+        delay(2000);
+
+        if (startUniqueMDNS(ShemeterName)) {
+            // mDNS responder started successfully
+        } else {
+            TIMED_PRINTLN("mDNS responder failed to start with a unique name.");
         }
 
         IPAddress storedShellyIP;
         storedShellyIP = IPAddress();
-        if (String(shellyIP).length() > 0)
-        {
+        if (String(shellyIP).length() > 0) {
             storedShellyIP.fromString(shellyIP);
         }
         bool storedValid = false;
-        if (storedShellyIP != IPAddress() && isValidShellyIP(shellyIP))
-        {
-            if (Ping.ping(storedShellyIP))
-            {
+        if (storedShellyIP != IPAddress() && isValidShellyIP(shellyIP)) {
+            if (Ping.ping(storedShellyIP)) {
                 storedValid = true;
                 TIMED_PRINTLN("Stored Shelly IP is reachable.");
-            }
-            else
-            {
+            } else {
                 TIMED_PRINTLN("Stored Shelly IP is not reachable.");
             }
         }
-        const int maxDevices = 10;
-        struct ShellyDevice
-        {
-            String name;
-            IPAddress ip;
-        };
-        ShellyDevice discoveredDevices[maxDevices];
-        int deviceCount = 0;
+
+        struct ShellyDevice { String name; IPAddress ip; };
+        std::vector<ShellyDevice> discoveredDevices;
         int n = MDNS.queryService("http", "tcp");
         TIMED_PRINT("mDNS query found ");
         Serial.println(n);
-        for (int i = 0; i < n && deviceCount < maxDevices; ++i)
-        {
+        for (int i = 0; i < n; ++i) {
             String host = MDNS.hostname(i);
-            if (host.startsWith("shelly"))
-            {
-                discoveredDevices[deviceCount].name = host;
-                discoveredDevices[deviceCount].ip = MDNS.IP(i);
-                TIMED_PRINT("Found Shelly device: " + host + " at " + discoveredDevices[deviceCount].ip.toString());
+            if (host.startsWith("shelly")) {
+                IPAddress ip = MDNS.IP(i);
+                discoveredDevices.push_back({ host, ip });
+                TIMED_PRINT("Found Shelly device: " + host + " at " + ip.toString());
                 Serial.println();
-                deviceCount++;
             }
         }
-        if (!storedValid && deviceCount == 1)
-        {
+        if (!storedValid && discoveredDevices.size() == 1) {
             discoveredDevices[0].ip.toString().toCharArray(shellyIP, sizeof(shellyIP));
             TIMED_PRINT("Using discovered Shelly device: " + discoveredDevices[0].name + " at " + String(shellyIP));
             Serial.println();
-        }
-        else if (storedValid)
-        {
+            saveConfigSPIFFS();
+        } else if (storedValid) {
             TIMED_PRINTLN("Using stored Shelly IP.");
-        }
-        else
-        {
+        } else {
             TIMED_PRINTLN("Multiple Shelly devices found or no devices discovered.");
         }
     }
@@ -969,68 +915,56 @@ void setup()
     wsClient.onMessage(onMessageCallback);
     wsClient.onEvent(handleWebSocketEvent);
 
-    if (isValidShellyIP(shellyIP))
-    {
+    if (isValidShellyIP(shellyIP)) {
         String wsUrl = String("ws://") + shellyIP + "/rpc";
         TIMED_PRINT("Connecting to WebSocket at: " + wsUrl);
         Serial.println();
-        if (wsClient.connect(wsUrl))
-        {
+        delay(500);
+        if (wsClient.connect(wsUrl)) {
             TIMED_PRINTLN("Connected to Shelly WebSocket");
-            sendEM1GetStatusRequests();
-        }
-        else
-        {
+            sendShellyGetStatus();
+        } else {
             TIMED_PRINTLN("Failed to connect to Shelly WebSocket");
         }
-    }
-    else
-    {
+    } else {
         TIMED_PRINTLN("No valid Shelly IP available. Skipping WebSocket connection.");
     }
 
     setupWebServer();
 }
 
-void loop()
-{
+void loop() {
     unsigned long currentMillis = millis();
 
-    if (currentMillis - previousMillis >= dataUpdateInterval)
-    {
+    if (currentMillis - previousMillis >= dataUpdateInterval) {
         previousMillis = currentMillis;
-        if (!wsClient.available())
-        {
+        if (!wsClient.available()) {
             checkAndEstablishWebSocket();
-        }
-#if !DISABLE_PERIODIC_RPC
-        else
-        {
+        } else {
             updateEnergyMeterData();
         }
-#endif
     }
 
-    displayMetricsOnStrip();
+    if (inSetup) {
+        blinkPWMLED(LED_STATUS_PIN, 500, 1);
+    }
 
-    if (newDataAvailable)
-    {
+
+
+    if (newDataAvailable) {
         String logMsg = "Energy meter data updated: ";
-        for (int i = 0; i < 3; i++)
-        {
+        for (int i = 0; i < 3; i++) {
             logMsg += meters[i].name + ": " + String(meters[i].act_power) + "W, ";
         }
 
+    displayMetricsOnStrip();
+
         int gridVal = 0;
         int solarVal = 0;
-        for (int i = 0; i < 3; i++)
-        {
-            if (meters[i].name.equalsIgnoreCase("Grid"))
-            {
+        for (int i = 0; i < 3; i++) {
+            if (meters[i].name.equalsIgnoreCase("Grid")) {
                 gridVal = meters[i].act_power;
-            }
-            else if (meters[i].name.equalsIgnoreCase("Solar"))
-            {
+            } else if (meters[i].name.equalsIgnoreCase("Solar")) {
                 solarVal = meters[i].act_power;
             }
         }
