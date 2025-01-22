@@ -789,7 +789,7 @@ void checkAndEstablishWebSocket() {
 
 void setup() {
     Serial.begin(115200);
-    while (!Serial) { ; }
+    //while (!Serial) { ; } // Uncomment this to prevent further progress without a serial connection (useful for troubleshooting)
 
     esp_task_wdt_init(60, true);
     esp_task_wdt_add(NULL);
