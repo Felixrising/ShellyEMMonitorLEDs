@@ -33,9 +33,6 @@ String timestamp() {
 
 #define MAX_BRIGHTNESS 255
 int globalBrightness = 32;
-#define LED_PIN 4
-#define LED_COUNT 60
-Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRBW + NEO_KHZ800);
 
 #ifndef USE_WS2812B_FOR_STATUS
 #define LED_STATUS_PIN 8
@@ -98,6 +95,12 @@ int commandId = 0;
 
 static StaticJsonDocument<20480> historyJsonDoc;
 
+// New LED configuration variables
+int LED_COUNT_var = 60;
+int LED_PIN_var = 4;
+uint32_t LED_TYPE_flags = NEO_GRBW + NEO_KHZ800;
+bool invertStrip = false;
+
 bool startUniqueMDNS(String& name);
 void blinkPWMLED(uint8_t pin, unsigned long interval, int blinks);
 bool tryConnectWiFi(const char* ssid, const char* password);
@@ -125,7 +128,17 @@ void handleHistory();
 void loadHistory();
 void setInitialTimeRange();
 
-// Utility Functions for LED Control
+bool isValidShellyHostname(const String& host) {
+    String lowerHost = host;
+    lowerHost.toLowerCase();
+    return lowerHost.startsWith("shelly") && host.indexOf('-') != -1;
+}
+
+bool isValidShellyIP(const char* ip) {
+    String ipStr = String(ip);
+    return ipStr.length() > 0 && ipStr != "xxx";
+}
+
 void blinkPWMLED(uint8_t pin, unsigned long interval, int blinks) {
     static unsigned long lastBlinkTime = 0;
     static int blinkCount = 0;
@@ -148,17 +161,6 @@ void flickStatusLED() {
     digitalWrite(LED_STATUS_PIN, HIGH);
     delay(100);
     digitalWrite(LED_STATUS_PIN, LOW);
-}
-
-bool isValidShellyHostname(const String& host) {
-    String lowerHost = host;
-    lowerHost.toLowerCase();
-    return lowerHost.startsWith("shelly") && host.indexOf('-') != -1;
-}
-
-bool isValidShellyIP(const char* ip) {
-    String ipStr = String(ip);
-    return ipStr.length() > 0 && ipStr != "xxx";
 }
 
 bool tryConnectWiFi(const char* ssid, const char* password) {
@@ -202,15 +204,15 @@ void displayMetricsOnStrip() {
         }
     }
 
-    uint32_t colorBoth = strip.Color(scaledBrightness(153), scaledBrightness(255), 0, 0);
+    uint32_t colorBoth     = strip.Color(scaledBrightness(153), scaledBrightness(255), 0, 0);
     uint32_t colorConsumer = strip.Color(scaledBrightness(255), 0, 0, 0);
-    uint32_t colorSolar = strip.Color(0, scaledBrightness(204), scaledBrightness(255), 0);
-    uint32_t colorOff = strip.Color(0, 0, 0, 0);
+    uint32_t colorSolar    = strip.Color(0, scaledBrightness(204), scaledBrightness(255), 0);
+    uint32_t colorOff      = strip.Color(0, 0, 0, 0);
 
     int minRaw = 100;
     int maxRaw = 5000;
-    int range = (maxRaw - minRaw);
-    int last = LED_COUNT - 1;
+    int range  = (maxRaw - minRaw);
+    int last   = LED_COUNT - 1;
 
     for (int i = 0; i < LED_COUNT; i++) {
         int ledValue = minRaw + (range * i) / last;
@@ -227,14 +229,12 @@ void displayMetricsOnStrip() {
     strip.show();
 }
 
-void handleRoot() {
-    server.send_P(200, "text/html", index_html);
-}
+void handleRoot() { server.send_P(200, "text/html", index_html); }
 
 void handleJson() {
     unsigned long clientTimestamp = server.arg("timestamp").toInt();
     String json = "{";
-    json += "\"SheMeterName\": \"" + ShemeterName + "\",";
+    json += "\"SheMeterName\": \"" + ShemeterName + "\","; 
     json += "\"meters\": [";
     for (int i = 0; i < 3; i++) {
         if (i > 0) json += ",";
@@ -289,6 +289,11 @@ bool loadConfigSPIFFS() {
     shellyIP[sizeof(shellyIP) - 1] = '\0';
     ShemeterName = sheName ? String(sheName) : "SheMonitor";
 
+    if (doc.containsKey("ledCount")) LED_COUNT_var = doc["ledCount"];
+    if (doc.containsKey("ledPin")) LED_PIN_var = doc["ledPin"];
+    if (doc.containsKey("ledType")) LED_TYPE_flags = doc["ledType"];
+    if (doc.containsKey("invertStrip")) invertStrip = doc["invertStrip"];
+
     if (doc.containsKey("meters") && doc["meters"].is<JsonArray>()) {
         JsonArray meterArray = doc["meters"].as<JsonArray>();
         int index = 0;
@@ -330,6 +335,10 @@ bool saveConfigSPIFFS() {
     doc["password"] = password;
     doc["shellyIP"] = shellyIP;
     doc["shemeterName"] = ShemeterName;
+    doc["ledCount"] = LED_COUNT_var;
+    doc["ledPin"] = LED_PIN_var;
+    doc["ledType"] = LED_TYPE_flags;
+    doc["invertStrip"] = invertStrip;
     JsonArray meterArray = doc.createNestedArray("meters");
     for (int i = 0; i < 3; i++) {
         meterArray.add(meters[i].name);
@@ -358,6 +367,12 @@ void handleConfig() {
         String meter0Role = server.arg("meter0");
         String meter1Role = server.arg("meter1");
         String meter2Role = server.arg("meter2");
+
+        // Retrieve new LED configuration fields from form
+        String ledCountStr = server.arg("ledCount");
+        String ledPinStr = server.arg("ledPin");
+        String ledTypeStr = server.arg("ledType");
+        bool ledInvert = server.hasArg("invertStrip");
 
         bool valid = true;
         String errorMsg = "";
@@ -397,6 +412,12 @@ void handleConfig() {
             meters[0].name = meter0Role;
             meters[1].name = meter1Role;
             meters[2].name = meter2Role;
+
+            // Update LED configuration
+            LED_COUNT_var = ledCountStr.toInt();
+            LED_PIN_var = ledPinStr.toInt();
+            LED_TYPE_flags = (uint32_t)ledTypeStr.toInt();
+            invertStrip = ledInvert;
 
             if (startUniqueMDNS(ShemeterName)) {
                 TIMED_PRINTLN("mDNS responder restarted with new ShemeterName.");
@@ -446,6 +467,12 @@ void handleConfig() {
         html += "<option value='Consumer'" + String(meters[2].name.equalsIgnoreCase("Consumer") ? " selected" : "") + ">Consumer</option>";
         html += "</select><br>";
         html += "Current Power: " + String(meters[2].act_power) + "W<br>";
+
+        // LED configuration fields
+        html += "LED Strip Length (Number of Pixels): <input type='number' name='ledCount' value='" + String(LED_COUNT_var) + "'><br>";
+        html += "LED Pin: <input type='number' name='ledPin' value='" + String(LED_PIN_var) + "'><br>";
+        html += "LED Type Flags: <input type='text' name='ledType' value='" + String(LED_TYPE_flags) + "'><br>";
+        html += "Invert LED Strip: <input type='checkbox' name='invertStrip'" + String(invertStrip ? " checked" : "") + "><br>";
 
         html += "<input type='submit' value='Save'>";
         html += "</form>";
