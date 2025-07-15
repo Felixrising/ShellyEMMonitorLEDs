@@ -1,93 +1,257 @@
 # Shelly Pro EM3 Energy Monitor LED Meter
 
 ## Project Overview
-The Shelly Pro EM3 Energy Monitor LED Meter helps homeowners track and manage energy usage effectively, especially with renewable energy sources. It connects to a Shelly Pro 3EM energy meter to display real-time data on Grid power, Solar power, and household consumption using an LED strip for visual feedback. This project uses an ESP32 board for processing and connectivity, with potential for ESP8266 support with modifications.
 
-**Important:** The Shelly Pro 3EM must be configured to run in monophase mode for this project. In this setup, use one CT (current transformer) clamp on the solar inverter feed-in and one on the consumer feed. With minor changes to the code, a configuration for measuring both Grid and Solar could be implemented in the future.
+The Shelly Pro EM3 Energy Monitor LED Meter is designed to help homeowners effectively use renewable energy. It connects to a Shelly Pro 3EM energy meter to display real-time data on Grid power, Solar power, and household consumption. This project uses an RGB LED strip for visual feedback on energy usage and is compatible with ESP32 boards.
 
 ## Purpose
-This device assists homeowners in optimizing their renewable energy usage by providing an intuitive LED display and interactive web interface. It offers immediate visual feedback on energy consumption and detailed historical data visualization, enabling informed energy management decisions.
+
+This device aims to assist homeowners in optimizing their use of renewable energy by providing an easy-to-understand display system. The LED strip offers clear indications to help make informed decisions about energy consumption.
 
 ## LED Indications
-- **Green LEDs:** Indicate energy usage from Solar sources.
-- **Cyan/Blue LEDs:** Indicate excess Solar energy fed into the Grid.
-- **Red LEDs:** Indicate energy consumption from the Grid.
 
-### Status LED Behavior
-- **During Setup:**  
-  The status LED blinks on and off every 500ms while the system is establishing a WiFi connection and synchronizing time.
-- **Post-Setup:**  
-  Once setup is complete, the LED flickers briefly each time a valid WebSocket message is received, signaling successful data fetches from the energy meter.
+* **Green LEDs**: Indicate energy usage from Solar sources
+* **Cyan/Blue LEDs**: Indicate excess Solar energy being fed into the Grid
+* **Red LEDs**: Indicate energy consumption from the Grid
+* **Yellow LEDs**: Indicate both Solar and Consumer usage simultaneously
 
 ## Key Features
-- Monitors real-time Grid, Solar, and Consumer power usage using Shelly Pro 3EM configured in monophase mode.
-- Visual feedback via an RGB LED strip that dynamically reflects energy consumption and source.
-- Web interface for real-time data display and historical energy usage visualization.
-- Status LED providing feedback during setup and data reception.
-- Robust WebSocket communication with ping/pong handling for maintaining connection with the Shelly device.
+
+### Core Functionality
+* Monitors real-time Grid, Solar, and Consumer power
+* Uses Shelly Pro 3EM's JSON API for data retrieval
+* Provides an interactive web interface for historical data visualization
+* Features an intuitive LED strip display for immediate energy status feedback
+
+### New in Version 2.0
+* **ArduinoJson v7 Support**: Modern dynamic JSON allocation for better memory management
+* **Dual Device Support**: Compatible with both Shelly Pro 3EM and dual single-phase Shelly EM setups
+* **Enhanced API Compatibility**: Supports both triphase and monophase profiles
+* **OTA Updates**: Over-the-air firmware updates for easy maintenance
+* **Improved Stability**: Comprehensive error handling and watchdog management
+* **Network Health Monitoring**: Automatic device discovery and connection recovery
+* **Memory Optimization**: Reduced memory footprint with streaming JSON responses
+* **Configuration Validation**: Input validation and error recovery
 
 ## Hardware Requirements
-- **Microcontroller:** Espressif board (ESP32 recommended; ESP8266 with modifications possible).
-- **Energy Meter:** Shelly Pro 3EM energy meter configured in monophase mode.
-  - Use one CT clamp on the solar inverter feed-in.
-  - Use one CT clamp on the consumer feed.
-  - *Note:* Future code changes may enable monitoring of both Grid and Solar simultaneously.
-- **LED Strip:** RGB LED strip compatible with the Adafruit NeoPixel library (adjust configuration for GRBW if needed).
-- **Status LED (Optional):** WS2812B LED or a standard PWM LED for status indication.
+
+* ESP32 board (ESP32-C3 SuperMini recommended)
+* Shelly Pro 3EM energy meter OR two single-phase Shelly EM devices
+* RGB LED strip (WS2812B/NeoPixel compatible)
+* Stable power supply for ESP32
 
 ## Software Dependencies
-- ArduinoJson (v6.17.0 or later)
-- Adafruit NeoPixel (v1.10.0 or later)
-- ArduinoWebsockets
-- ESP32Ping
-- SPIFFS (for file storage and configuration)
+
+* **ArduinoJson** (v7.4.2 or later) - Modern JSON handling with dynamic allocation
+* **Adafruit NeoPixel** (v1.10.0 or later) - LED strip control
+* **ArduinoWebsockets** - WebSocket communication with Shelly devices
+* **ESP32Ping** - Network health monitoring
+* **ArduinoOTA** - Over-the-air updates
+* **EEPROM/SPIFFS** - Configuration storage
 
 ## Configuration and Setup
-1. **Hardware Setup:**  
-   - Connect the LED strip data line to the designated GPIO pin on the ESP32 (default is GPIO4).
-   - Ensure proper power supply and ground connections for the LED strip and microcontroller.
-   - Configure the Shelly Pro 3EM energy meter to run in monophase mode with one CT clamp on the solar inverter feed-in and one on the consumer feed.
-   - Connect the Shelly Pro 3EM energy meter to the network and ensure it is accessible.
 
-2. **Software Configuration:**  
-   - Configure WiFi credentials, Shelly device IP, and other parameters via the web configuration page after initial setup.
-   - Use PlatformIO in VSCode to build and upload the code to the ESP32 board.
-   - The code automatically manages WiFi connection, time synchronization, WebSocket communication, and LED display updates.
+### Initial Setup
+1. Flash the firmware to your ESP32 board using PlatformIO
+2. Connect the LED strip to the configured GPIO pin (default: GPIO 4)
+3. Power on the device - it will create a WiFi access point
+4. Connect to the AP and configure WiFi credentials via SmartConfig or web interface
+5. Access the web interface to configure Shelly device settings
 
-3. **Running the Device:**  
-   - On boot, the status LED will blink while connecting to WiFi and synchronizing time.
-   - After setup, the LED strip displays real‑time energy metrics.
-   - The status LED flickers briefly when new data is successfully fetched from the Shelly device.
+### Web Configuration
+Access the device's web interface at `http://[device-ip]/config` to configure:
 
-## Web Interface
-Access the device's web interface via its IP address on your network to:
-- View real‑time energy usage and historical data charts.
-- Configure WiFi settings and Shelly device details.
-- Monitor system status and adjust settings as needed.
+* **WiFi Settings**: SSID and password
+* **Shelly Device**: IP address or hostname
+* **Device Name**: mDNS hostname for the device
+* **Meter Assignments**: Configure which physical meter corresponds to Grid/Solar/Consumer
+* **LED Strip Settings**: 
+  * Number of LEDs (1-300)
+  * GPIO pin (0-39)
+  * LED type flags
+  * Strip inversion option
 
-## Troubleshooting and Common Issues
-- **LED Strip Not Displaying:**  
-  Verify correct LED strip type (RGB vs. GRBW), wiring, power supply, and configuration in the code (ensure the correct pin and LED type flags are set).
-- **No LED Activity:**  
-  Check that the LED pin is defined correctly and that the LED strip is receiving power and data signals.
-- **WiFi/Connection Issues:**  
-  Confirm WiFi credentials, network connectivity, and proper configuration via the web page.
-- **WebSocket Communication:**  
-  Ensure the Shelly device is reachable at the specified IP and that the WebSocket endpoint is correct. Check serial logs for errors in connecting or maintaining the WebSocket.
-- **LED Status Behavior:**  
-  During setup, watch for blinking on the status LED. After setup, observe brief flickers on receiving WebSocket messages as an indication of data updates.
+### Automatic Discovery
+The device automatically discovers Shelly devices on the network using mDNS. Supported devices:
+* Shelly Pro 3EM (single device, three phases)
+* Shelly EM (dual device setup for two single-phase meters)
 
-## Future Roadmap
-- **Multiple Shelly EM Units:**  
-  Future enhancements may support using multiple individual Shelly EM devices instead of a single Shelly Pro 3EM running in monophase mode. This would allow finer granularity of monitoring across different circuits.
-- **Frequency Slider and Downsampling:**  
-  Implement a slider for adjusting update frequency and corresponding downsampling of historical data.
-- **OTA Firmware Updates:**  
-  Over-The-Air updates for easier maintenance.
-- **Enhanced Configuration Interface:**  
-  Comprehensive web-based configuration for easier setup and customization.
-- **Adaptive Brightness and Additional Features:**  
-  Adjust LED brightness based on ambient light, daily email summaries, integration with home automation systems, enhanced security, and more.
+## API Compatibility
+
+### Shelly Pro 3EM Profiles
+The device supports both operational profiles:
+
+#### Triphase Profile
+- Uses single `EM` component (`em:0`)
+- Accesses `a_act_power`, `b_act_power`, `c_act_power`
+- Suitable for true three-phase installations
+
+#### Monophase Profile  
+- Uses three `EM1` components (`em1:0`, `em1:1`, `em1:2`)
+- Each component reports individual `act_power`
+- Suitable for standalone CT monitoring
+
+### Dual Shelly EM Support
+For users with two single-phase Shelly EM devices:
+- Automatic discovery of multiple devices
+- Channel offset management
+- Unified data presentation
+
+## Status LED Indication
+
+The device includes a status LED for system feedback:
+
+### Status LED Types
+Configure using `USE_WS2812B_FOR_STATUS` define:
+- **WS2812B LED** (GPIO 7): Full color status indication
+- **PWM LED** (GPIO 8): Blink pattern status indication
+
+### Status Meanings
+
+| Color/Pattern | Meaning |
+|---------------|---------|
+| Solid Orange (WS2812B) / Rapid Blink (PWM) | Connecting to WiFi |
+| Solid Yellow (WS2812B) / Multiple Blinks (PWM) | Clearing EEPROM |
+| Solid Green (WS2812B) / Solid On (PWM) | WiFi Connected |
+| Blink Green (WS2812B) / Series of Blinks (PWM) | Data received from energy meter |
+
+## Advanced Features
+
+### Over-the-Air Updates
+- Access via web interface: `/ota` endpoint
+- Secure password-protected updates
+- Progress monitoring via serial console
+- Automatic rollback on failure
+
+### Network Health Monitoring
+- Automatic ping testing of Shelly devices
+- Connection recovery and retry logic
+- WebSocket timeout detection
+- Automatic device rediscovery
+
+### Memory Management
+- ArduinoJson v7 dynamic allocation
+- Streaming JSON responses for large datasets
+- Optimized history buffer size
+- Garbage collection and cleanup
+
+### Error Handling
+- Comprehensive input validation
+- Graceful degradation on failures
+- Watchdog timer management
+- Request timeout handling
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Device Not Connecting to WiFi**
+   - Check credentials in web interface
+   - Try SmartConfig setup
+   - Verify network compatibility
+
+2. **LED Strip Not Working**
+   - Verify GPIO pin configuration
+   - Check LED count and type settings
+   - Ensure adequate power supply
+
+3. **Shelly Device Not Found**
+   - Check IP address configuration
+   - Verify network connectivity
+   - Try automatic discovery
+
+4. **Periodic Crashes (Fixed in v2.0)**
+   - Update to latest firmware
+   - Check memory usage
+   - Monitor serial output for errors
+
+### Debug Information
+Enable detailed logging by monitoring the serial console at 115200 baud. All messages include timestamps for debugging.
+
+## Security Considerations
+
+* Change default OTA password in code
+* Use secure WiFi networks
+* Consider network segmentation for IoT devices
+* Regular firmware updates
+
+## Future Enhancements
+
+* **Mobile App**: Dedicated smartphone application
+* **Cloud Integration**: Remote monitoring capabilities
+* **Advanced Analytics**: Machine learning for usage patterns
+* **Multi-device Support**: Manage multiple installations
+* **Energy Forecasting**: Predictive analytics for energy usage
+
+## Performance Optimizations
+
+### Memory Usage
+- Reduced history buffer: 144 entries (2.4 hours)
+- Dynamic JSON allocation
+- Streaming web responses
+- Efficient data structures
+
+### Network Efficiency
+- Connection pooling
+- Retry logic with backoff
+- Health monitoring
+- Automatic recovery
+
+### Processing Efficiency
+- Watchdog timer management
+- Non-blocking operations
+- Efficient LED updates
+- Optimized data structures
+
+## Development
+
+### Building
+```bash
+# Using PlatformIO
+pio run
+
+# Upload firmware
+pio run --target upload
+
+# Monitor serial output
+pio device monitor
+```
+
+### Contributing
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Test thoroughly
+5. Submit a pull request
 
 ## License and Contributions
-This open-source project welcomes contributions to improve functionality and usability. Please refer to the project's license for usage and distribution terms.
+
+This open-source project welcomes contributions to improve functionality and usability. Please follow the existing code style and include appropriate tests.
+
+## Version History
+
+### Version 2.0 (Current)
+- ArduinoJson v7 compatibility
+- Dual device support
+- OTA updates
+- Enhanced stability
+- Memory optimization
+- Comprehensive error handling
+
+### Version 1.0 (Legacy)
+- Basic Shelly 3EM support
+- LED strip visualization
+- Web interface
+- Configuration management
+
+## Support
+
+For issues, questions, or contributions:
+1. Check the troubleshooting section
+2. Review existing GitHub issues
+3. Create a new issue with detailed information
+4. Include serial console output for debugging
+
+---
+
+**Note**: This is production-ready firmware with comprehensive error handling and stability improvements. The periodic crash issues from earlier versions have been resolved through proper memory management, timeout handling, and network resilience features.
