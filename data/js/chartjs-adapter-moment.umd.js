@@ -1,0 +1,1 @@
+Couldn't find the requested file /dist/chartjs-adapter-moment.umd.js in chartjs-adapter-moment.

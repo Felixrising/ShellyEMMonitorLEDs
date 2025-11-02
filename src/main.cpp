@@ -1,13 +1,15 @@
 #include <WiFi.h>
 #include <ESPmDNS.h>
+#include <DNSServer.h>
 #include <ArduinoJson.h>
 #include <WebServer.h>
 #include <Adafruit_NeoPixel.h>
-#include <SPIFFS.h>
+#include <LittleFS.h>
 #include <ArduinoWebsockets.h>
 #include <esp_task_wdt.h>
 #include <ESP32Ping.h>
 #include <ArduinoOTA.h>
+#include <ezTime.h>
 #include <map>
 #include <vector>
 #include "includes.h"
@@ -69,14 +71,20 @@ uint64_t deviceStartTimeMillis = 0;
 const char* defaultSSID = "";
 const char* defaultPassword = "";
 const char* defaultShellyIP = "";
+const char* defaultTimezone = "Australia/Sydney";
 
 String ShemeterName = "SheMonitor";
 String fallbackSSID = ShemeterName + "AP";
-const char* fallbackPWD = "12345678";
 
 char ssid[32] = "";
 char password[64] = "";
 char shellyIP[16] = "";
+char timezone[64] = "Australia/Sydney";
+
+// Time and uptime tracking
+Timezone myTZ;
+unsigned long startTime = 0;
+bool timeInitialized = false;
 
 // Timing
 unsigned long previousMillis = 0;
@@ -111,13 +119,15 @@ struct DataPoint {
     int consumer;
 };
 
-const int HISTORY_SIZE = 144; // 2.4 hours at 1-minute intervals (reduced for memory optimization)
+const int HISTORY_SIZE = 72; // 1.2 hours at 1-minute intervals (further reduced for ESP32-C3 memory constraints)
 DataPoint history[HISTORY_SIZE];
 int historyIndex = 0;
 
 // Network components
 WebServer server(80);
+DNSServer dnsServer;
 WebsocketsClient wsClient;
+bool isAPMode = false;  // Track if we're in AP mode for captive portal
 
 const char* configPath = "/config.json";
 
@@ -134,6 +144,82 @@ int LED_COUNT_var = 60;
 int LED_PIN_var = 4;
 uint32_t LED_TYPE_flags = NEO_GRBW + NEO_KHZ800;
 bool invertStrip = false;
+
+// LED Type definitions for common ICs
+struct LEDType {
+    const char* name;
+    const char* description;
+    uint32_t flags;
+};
+
+const LEDType LED_TYPES[] = {
+    {"WS2812B", "WS2812B - RGB (800KHz, GRB order)", NEO_GRB + NEO_KHZ800},
+    {"WS2812B_RGBW", "WS2812B - RGBW (800KHz, GRBW order)", NEO_GRBW + NEO_KHZ800},
+    {"WS2811", "WS2811 - RGB (400KHz, RGB order)", NEO_RGB + NEO_KHZ400},
+    {"WS2811_800", "WS2811 - RGB (800KHz, RGB order)", NEO_RGB + NEO_KHZ800},
+    {"WS2813", "WS2813 - RGB (800KHz, GRB order)", NEO_GRB + NEO_KHZ800},
+    {"SK6812", "SK6812 - RGB (800KHz, GRB order)", NEO_GRB + NEO_KHZ800},
+    {"SK6812_RGBW", "SK6812 - RGBW (800KHz, GRBW order)", NEO_GRBW + NEO_KHZ800},
+    {"APA102", "APA102/DotStar - RGB (GRB order)", NEO_GRB + NEO_KHZ800},
+    {"CUSTOM_RGB", "Custom RGB (800KHz, RGB order)", NEO_RGB + NEO_KHZ800},
+    {"CUSTOM_BGR", "Custom BGR (800KHz, BGR order)", NEO_BGR + NEO_KHZ800},
+    {"CUSTOM_BRG", "Custom BRG (800KHz, BRG order)", NEO_BRG + NEO_KHZ800},
+    {"CUSTOM_GBR", "Custom GBR (800KHz, GBR order)", NEO_GBR + NEO_KHZ800},
+    {"CUSTOM_RBG", "Custom RBG (800KHz, RBG order)", NEO_RBG + NEO_KHZ800}
+};
+
+const int LED_TYPES_COUNT = sizeof(LED_TYPES) / sizeof(LED_TYPES[0]);
+
+// Current LED type index
+int currentLEDTypeIndex = 0;
+
+// Timezone definitions for dropdown
+struct TimezoneInfo {
+    const char* name;
+    const char* olson;
+};
+
+const TimezoneInfo TIMEZONES[] = {
+    {"UTC", "UTC"},
+    {"GMT", "GMT"},
+    {"US/Eastern", "America/New_York"},
+    {"US/Central", "America/Chicago"},
+    {"US/Mountain", "America/Denver"},
+    {"US/Pacific", "America/Los_Angeles"},
+    {"US/Alaska", "America/Anchorage"},
+    {"US/Hawaii", "Pacific/Honolulu"},
+    {"Europe/London", "Europe/London"},
+    {"Europe/Paris", "Europe/Paris"},
+    {"Europe/Berlin", "Europe/Berlin"},
+    {"Europe/Rome", "Europe/Rome"},
+    {"Europe/Madrid", "Europe/Madrid"},
+    {"Europe/Amsterdam", "Europe/Amsterdam"},
+    {"Europe/Stockholm", "Europe/Stockholm"},
+    {"Europe/Moscow", "Europe/Moscow"},
+    {"Asia/Tokyo", "Asia/Tokyo"},
+    {"Asia/Shanghai", "Asia/Shanghai"},
+    {"Asia/Hong_Kong", "Asia/Hong_Kong"},
+    {"Asia/Singapore", "Asia/Singapore"},
+    {"Asia/Bangkok", "Asia/Bangkok"},
+    {"Asia/Dubai", "Asia/Dubai"},
+    {"Asia/Kolkata", "Asia/Kolkata"},
+    {"Australia/Sydney", "Australia/Sydney"},
+    {"Australia/Melbourne", "Australia/Melbourne"},
+    {"Australia/Brisbane", "Australia/Brisbane"},
+    {"Australia/Perth", "Australia/Perth"},
+    {"Australia/Adelaide", "Australia/Adelaide"},
+    {"Australia/Darwin", "Australia/Darwin"},
+    {"Pacific/Auckland", "Pacific/Auckland"},
+    {"America/Toronto", "America/Toronto"},
+    {"America/Vancouver", "America/Vancouver"},
+    {"America/Mexico_City", "America/Mexico_City"},
+    {"America/Sao_Paulo", "America/Sao_Paulo"},
+    {"America/Buenos_Aires", "America/Argentina/Buenos_Aires"},
+    {"Africa/Cairo", "Africa/Cairo"},
+    {"Africa/Johannesburg", "Africa/Johannesburg"}
+};
+
+const int TIMEZONES_COUNT = sizeof(TIMEZONES) / sizeof(TIMEZONES[0]);
 
 // LED strip instance - will be initialized after config load
 Adafruit_NeoPixel* strip = nullptr;
@@ -152,6 +238,7 @@ bool saveConfigSPIFFS();
 void handleConfig();
 void setupWebServer();
 void checkWiFiConnection();
+void startAPMode();
 void updateEnergyMeterData();
 int sendRequest(const char* method, JsonVariant params, std::function<void(JsonObject&)> callback);
 void onMessageCallback(WebsocketsMessage message);
@@ -178,6 +265,70 @@ void connectToMultipleDevices();
 void setupOTA();
 void handleOTA();
 
+// Helper function to find LED type index by flags
+int findLEDTypeIndex(uint32_t flags) {
+    for (int i = 0; i < LED_TYPES_COUNT; i++) {
+        if (LED_TYPES[i].flags == flags) {
+            return i;
+        }
+    }
+    return 0; // Default to first type if not found
+}
+
+// Helper function to get LED type name by flags
+String getLEDTypeName(uint32_t flags) {
+    for (int i = 0; i < LED_TYPES_COUNT; i++) {
+        if (LED_TYPES[i].flags == flags) {
+            return String(LED_TYPES[i].name);
+        }
+    }
+    return "Unknown";
+}
+
+// Helper function to find timezone index by Olson name
+int findTimezoneIndex(const char* olson) {
+    for (int i = 0; i < TIMEZONES_COUNT; i++) {
+        if (strcmp(TIMEZONES[i].olson, olson) == 0) {
+            return i;
+        }
+    }
+    return 23; // Default to Australia/Sydney
+}
+
+// Helper function to get timezone display name
+String getTimezoneDisplayName(const char* olson) {
+    for (int i = 0; i < TIMEZONES_COUNT; i++) {
+        if (strcmp(TIMEZONES[i].olson, olson) == 0) {
+            return String(TIMEZONES[i].name);
+        }
+    }
+    return "Unknown";
+}
+
+// Helper function to format uptime
+String formatUptime(unsigned long uptimeSeconds) {
+    unsigned long days = uptimeSeconds / 86400;
+    uptimeSeconds %= 86400;
+    unsigned long hours = uptimeSeconds / 3600;
+    uptimeSeconds %= 3600;
+    unsigned long minutes = uptimeSeconds / 60;
+    unsigned long seconds = uptimeSeconds % 60;
+    
+    String result = "";
+    if (days > 0) {
+        result += String(days) + "d ";
+    }
+    if (hours > 0 || days > 0) {
+        result += String(hours) + "h ";
+    }
+    if (minutes > 0 || hours > 0 || days > 0) {
+        result += String(minutes) + "m ";
+    }
+    result += String(seconds) + "s";
+    
+    return result;
+}
+
 // Validation functions
 bool validateConfig() {
     bool valid = true;
@@ -191,6 +342,15 @@ bool validateConfig() {
     if (LED_PIN_var < 0 || LED_PIN_var > 39) {
         TIMED_PRINTLN("Invalid LED pin, resetting to default");
         LED_PIN_var = 4;
+        valid = false;
+    }
+    
+    // Validate LED type flags
+    currentLEDTypeIndex = findLEDTypeIndex(LED_TYPE_flags);
+    if (currentLEDTypeIndex == 0 && LED_TYPE_flags != LED_TYPES[0].flags) {
+        TIMED_PRINTLN("Invalid LED type flags, resetting to default");
+        LED_TYPE_flags = LED_TYPES[0].flags;
+        currentLEDTypeIndex = 0;
         valid = false;
     }
     
@@ -208,7 +368,11 @@ void initializeLEDStrip() {
     strip->setBrightness(scaledBrightness());
     strip->show();
     
-    TIMED_PRINTLN("LED strip initialized: " + String(LED_COUNT_var) + " LEDs on pin " + String(LED_PIN_var));
+    TIMED_PRINTLN("LED strip initialized:");
+    TIMED_PRINTLN("  Type: " + getLEDTypeName(LED_TYPE_flags) + " (0x" + String(LED_TYPE_flags, HEX) + ")");
+    TIMED_PRINTLN("  Count: " + String(LED_COUNT_var) + " LEDs");
+    TIMED_PRINTLN("  Pin: " + String(LED_PIN_var));
+    TIMED_PRINTLN("  Inverted: " + String(invertStrip ? "Yes" : "No"));
 }
 
 // Network and connection management
@@ -245,6 +409,11 @@ void checkWebSocketHealth() {
 }
 
 void monitorNetworkHealth() {
+    // Don't perform network health checks if WiFi isn't connected
+    if (WiFi.status() != WL_CONNECTED) {
+        return;
+    }
+    
     static unsigned long lastPing = 0;
     if (millis() - lastPing > NETWORK_HEALTH_CHECK_INTERVAL) {
         lastPing = millis();
@@ -273,6 +442,12 @@ bool isValidShellyIP(const char* ip) {
 }
 
 void discoverShellyDevices() {
+    // Don't attempt discovery if WiFi isn't connected
+    if (WiFi.status() != WL_CONNECTED) {
+        TIMED_PRINTLN("Skipping Shelly discovery - WiFi not connected");
+        return;
+    }
+    
     if (millis() - lastMDNSQuery < MDNS_QUERY_INTERVAL) {
         return;
     }
@@ -355,14 +530,17 @@ void displayMetricsOnStrip() {
 
     for (int i = 0; i < LED_COUNT_var; i++) {
         int ledValue = minRaw + (range * i) / last;
+        // Calculate actual physical LED index based on strip direction
+        int physicalLED = invertStrip ? (LED_COUNT_var - 1 - i) : i;
+        
         if (ledValue <= consumerValue && ledValue <= solarValue) {
-            strip->setPixelColor(i, colorBoth);
+            strip->setPixelColor(physicalLED, colorBoth);
         } else if (ledValue <= consumerValue) {
-            strip->setPixelColor(i, colorConsumer);
+            strip->setPixelColor(physicalLED, colorConsumer);
         } else if (ledValue <= solarValue) {
-            strip->setPixelColor(i, colorSolar);
+            strip->setPixelColor(physicalLED, colorSolar);
         } else {
-            strip->setPixelColor(i, colorOff);
+            strip->setPixelColor(physicalLED, colorOff);
         }
     }
     strip->show();
@@ -395,7 +573,19 @@ void flickStatusLED() {
 
 // WiFi connection management
 bool tryConnectWiFi(const char* ssid, const char* password) {
-    WiFi.disconnect();
+    // Don't try to connect if SSID is empty or too long
+    if (!ssid || strlen(ssid) == 0 || strlen(ssid) >= 32) {
+        TIMED_PRINTLN("Invalid SSID - not attempting connection");
+        return false;
+    }
+    
+    // Ensure we're in STA mode
+    WiFi.mode(WIFI_STA);
+    delay(100);
+    
+    WiFi.disconnect(true);
+    delay(100);
+    
     WiFi.begin(ssid, password);
     unsigned long startTime = millis();
     TIMED_PRINT("Connecting to WiFi");
@@ -415,25 +605,374 @@ bool tryConnectWiFi(const char* ssid, const char* password) {
 }
 
 void checkWiFiConnection() {
-    if (WiFi.status() != WL_CONNECTED) {
+    static unsigned long lastRetryAttempt = 0;
+    const unsigned long RETRY_INTERVAL = 300000; // 5 minutes
+    
+    // If we're in AP mode (or AP+STA mode), periodically try to reconnect with stored credentials
+    if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA || isAPMode) {
+        // While in AP mode, periodically try stored credentials if they exist
+        if (strlen(ssid) > 0 && strlen(ssid) < 32) {
+            if (millis() - lastRetryAttempt > RETRY_INTERVAL) {
+                lastRetryAttempt = millis();
+                TIMED_PRINTLN("AP mode: Attempting to reconnect with stored credentials...");
+                TIMED_PRINTLN("Trying SSID: " + String(ssid));
+                
+                // Stop AP mode services temporarily
+                dnsServer.stop();
+                server.stop();
+                delay(100);
+                
+                // Try to connect in STA mode
+                WiFi.mode(WIFI_OFF);
+                delay(500);
+                WiFi.mode(WIFI_STA);
+                delay(100);
+                
+                if (tryConnectWiFi(ssid, password)) {
+                    TIMED_PRINTLN("Successfully reconnected! Exiting AP mode.");
+                    isAPMode = false;
+                    
+                    // Reinitialize services for STA mode
+                    setupWebServer();
+                    
+                    // Initialize ezTime if not already done
+                    if (!timeInitialized) {
+                        TIMED_PRINTLN("Initializing time synchronization...");
+                        setDebug(INFO);
+                        waitForSync();
+                        if (myTZ.setLocation(timezone)) {
+                            TIMED_PRINTLN("Timezone set to: " + getTimezoneDisplayName(timezone));
+                            TIMED_PRINTLN("Current time: " + myTZ.dateTime("Y-m-d H:i:s T"));
+                            timeInitialized = true;
+                        }
+                    }
+                    
+                    // Setup mDNS if needed
+                    MDNS.end();
+                    if (startUniqueMDNS(ShemeterName)) {
+                        TIMED_PRINTLN("mDNS responder restarted successfully.");
+                    }
+                    
+                    // Discover Shelly devices
+                    discoverShellyDevices();
+                    
+                    TIMED_PRINTLN("Switched from AP mode to STA mode successfully!");
+                    TIMED_PRINTLN("Device accessible at: http://" + WiFi.localIP().toString());
+                } else {
+                    TIMED_PRINTLN("Retry failed. Returning to AP mode.");
+                    startAPMode();
+                }
+            }
+        }
+        return; // Don't proceed to STA checks if we're in AP mode
+    }
+    
+    // Only try to reconnect if we have valid credentials and we're in STA mode
+    if (WiFi.getMode() == WIFI_STA && WiFi.status() != WL_CONNECTED) {
+        // Check if we have valid stored credentials
+        if (strlen(ssid) > 0 && strlen(ssid) < 32) {
         TIMED_PRINTLN("WiFi connection lost. Attempting to reconnect...");
         if (tryConnectWiFi(ssid, password)) {
             TIMED_PRINTLN("WiFi reconnected.");
         } else {
-            TIMED_PRINTLN("Reconnection failed.");
+                TIMED_PRINTLN("Reconnection failed. Switching to AP mode...");
+                startAPMode();
+            }
+        } else {
+            TIMED_PRINTLN("No valid WiFi credentials. Starting AP mode...");
+            startAPMode();
         }
     }
 }
 
+
+
+void startAPMode() {
+    TIMED_PRINTLN("DEBUG: startAPMode() called! millis=" + String(millis()));
+    static unsigned long lastAPAttempt = 0;
+    TIMED_PRINTLN("DEBUG: lastAPAttempt=" + String(lastAPAttempt));
+    // Prevent rapid AP mode switching (minimum 10 seconds between attempts)
+    if (millis() - lastAPAttempt < 10000 && lastAPAttempt != 0) {
+        TIMED_PRINTLN("AP mode start throttled - too soon since last attempt");
+        return;
+    }
+    lastAPAttempt = millis();
+    TIMED_PRINTLN("DEBUG: startAPMode() executing past throttle check...");
+    
+    TIMED_PRINTLN("Starting Access Point mode for WiFi configuration...");
+    
+    // Stop web server if it's running
+    server.stop();
+    delay(100);
+    
+    // Safely disconnect and reset WiFi
+    WiFi.disconnect(true, true);
+    delay(1000);
+    
+    // Clear WiFi mode
+    WiFi.mode(WIFI_OFF);
+    delay(1000);
+    
+    // Start AP+STA mode to allow WiFi scanning while AP is active
+    WiFi.mode(WIFI_AP_STA);
+    delay(1000);
+    
+    // Configure AP with fixed IP
+    IPAddress local_IP(192, 168, 4, 1);
+    IPAddress gateway(192, 168, 4, 1);
+    IPAddress subnet(255, 255, 255, 0);
+    WiFi.softAPConfig(local_IP, gateway, subnet);
+    
+    // Start AP without password for easier configuration
+    TIMED_PRINTLN("DEBUG: Calling WiFi.softAP with SSID: " + fallbackSSID);
+    bool apStarted = WiFi.softAP(fallbackSSID.c_str(), nullptr, 1, false, 4);
+    TIMED_PRINTLN("DEBUG: WiFi.softAP returned: " + String(apStarted ? "true" : "false"));
+    
+    if (apStarted) {
+        delay(2000); // Give AP time to fully start
+        TIMED_PRINTLN("Access Point started successfully!");
+        TIMED_PRINTLN("Network: " + fallbackSSID + " (No Password)");
+        TIMED_PRINTLN("AP IP: " + WiFi.softAPIP().toString());
+        TIMED_PRINTLN("Connect to this network and navigate to: http://" + WiFi.softAPIP().toString() + "/wificonfig");
+        TIMED_PRINTLN("The configuration page will help you set up WiFi credentials.");
+        
+        // Set AP mode flag for captive portal
+        isAPMode = true;
+        
+        // Start DNS server for captive portal (redirects all DNS requests to our IP)
+        dnsServer.start(53, "*", WiFi.softAPIP());
+        TIMED_PRINTLN("DNS server started for captive portal");
+        
+        // Start web server for AP mode
+        setupWebServer();
+        TIMED_PRINTLN("Configuration web server started");
+        
+        // Additional diagnostics
+        TIMED_PRINTLN("AP Stations: " + String(WiFi.softAPgetStationNum()));
+        TIMED_PRINTLN("AP Channel: " + String(WiFi.channel()));
+    } else {
+        TIMED_PRINTLN("Failed to start Access Point!");
+        delay(2000);
+        ESP.restart(); // Restart if AP fails to start
+    }
+}
+
+// WiFi configuration portal handlers
+void handleWiFiConfig() {
+    String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+    html += "<title>" + ShemeterName + " - WiFi Setup</title>";
+    html += "<style>body{font-family:Arial,sans-serif;margin:20px;background:#f0f0f0}";
+    html += ".container{max-width:400px;margin:0 auto;background:white;padding:20px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}";
+    html += "h1{color:#333;margin-top:0}";
+    html += ".network{padding:12px;margin:8px 0;background:#f9f9f9;border:1px solid #ddd;border-radius:4px;cursor:pointer;display:flex;justify-content:space-between;align-items:center}";
+    html += ".network:hover{background:#e9e9e9}";
+    html += ".network.selected{background:#d0e8ff;border-color:#0066cc}";
+    html += ".signal{font-size:0.9em;color:#666}";
+    html += "input[type=password]{width:100%;padding:10px;margin:8px 0;border:1px solid #ddd;border-radius:4px;box-sizing:border-box}";
+    html += "button{width:100%;padding:12px;background:#0066cc;color:white;border:none;border-radius:4px;font-size:16px;cursor:pointer;margin-top:10px}";
+    html += "button:hover{background:#0052a3}";
+    html += ".scanning{text-align:center;padding:20px;color:#666}";
+    html += ".status{padding:10px;margin:10px 0;border-radius:4px;display:none}";
+    html += ".status.success{background:#d4edda;color:#155724;display:block}";
+    html += ".status.error{background:#f8d7da;color:#721c24;display:block}</style></head>";
+    html += "<body><div class='container'><h1>🔌 WiFi Setup</h1>";
+    html += "<p>Configure " + ShemeterName + " to connect to your WiFi network.</p>";
+    html += "<div id='status' class='status'></div>";
+    html += "<div id='networks' class='scanning'>Scanning for networks...</div>";
+    html += "<div id='configForm' style='display:none'>";
+    html += "<input type='password' id='password' placeholder='WiFi Password' />";
+    html += "<button onclick='connect()'>Connect</button></div>";
+    html += "<script>";
+    html += "let selectedSSID='';";
+    html += "function selectNetwork(ssid){selectedSSID=ssid;document.querySelectorAll('.network').forEach(n=>n.classList.remove('selected'));";
+    html += "event.target.closest('.network').classList.add('selected');document.getElementById('configForm').style.display='block';}";
+    html += "function connect(){const pwd=document.getElementById('password').value;";
+    html += "fetch('/wifisave',{method:'POST',headers:{'Content-Type':'application/json'},";
+    html += "body:JSON.stringify({ssid:selectedSSID,password:pwd})}).then(r=>r.json()).then(d=>{";
+    html += "const s=document.getElementById('status');if(d.success){s.className='status success';s.textContent='✓ Connecting to '+selectedSSID+'... Device will restart.';";
+    html += "setTimeout(()=>window.location.href='http://'+selectedSSID.toLowerCase()+'.local',5000);}";
+    html += "else{s.className='status error';s.textContent='✗ Failed: '+d.message;}}).catch(e=>{";
+    html += "document.getElementById('status').className='status error';document.getElementById('status').textContent='✗ Connection failed';});}";
+    html += "fetch('/wifiscan').then(r=>r.json()).then(d=>{";
+    html += "console.log('Scan response:', d);"; // Debug logging
+    html += "if(d.error){document.getElementById('networks').innerHTML='<p>Scan error: '+d.error+'. <a href=\"javascript:location.reload()\">Retry</a></p>';return;}";
+    html += "if(d.message){document.getElementById('networks').innerHTML='<p>'+d.message+'</p>';return;}";
+    html += "if(!d.networks||d.networks.length===0){document.getElementById('networks').innerHTML='<p>No networks found. <a href=\"javascript:location.reload()\">Retry</a></p>';return;}";
+    html += "let html='';d.networks.forEach(n=>{if(!n.ssid||n.ssid.trim()==='')return;"; // Skip empty SSIDs
+    html += "const bars='📶'.repeat(Math.max(1,Math.ceil((n.rssi+100)/20)));"; // Better RSSI calculation
+    html += "html+='<div class=\"network\" onclick=\"selectNetwork(\\''+n.ssid.replace(/'/g,\"\\\\'\")+'\\')\">';";
+    html += "html+='<span>'+n.ssid+(n.secure?' 🔒':'')+'</span><span class=\"signal\">'+bars+'</span></div>';});";
+    html += "document.getElementById('networks').innerHTML=html||'<p>No networks found</p>';}).catch(e=>{";
+    html += "console.error('Scan failed:', e);";
+    html += "document.getElementById('networks').innerHTML='<p>Scan request failed. <a href=\"javascript:location.reload()\">Retry</a></p>';});</script></div></body></html>";
+    
+    server.send(200, "text/html", html);
+}
+
+void handleWiFiScan() {
+    TIMED_PRINTLN("=== WiFi Scan Request Received ===");
+    
+    JsonDocument doc;
+    JsonArray networks = doc["networks"].to<JsonArray>();
+    
+    // Ensure we're in a mode that supports scanning
+    wifi_mode_t currentMode = WiFi.getMode();
+    TIMED_PRINTLN("Current WiFi mode: " + String(currentMode));
+    
+    if (currentMode != WIFI_AP_STA && currentMode != WIFI_STA) {
+        TIMED_PRINTLN("WiFi scan: Switching to AP_STA mode for scanning");
+        WiFi.mode(WIFI_AP_STA);
+        delay(100);
+    }
+    
+    // Perform WiFi scan with explicit settings for better reliability
+    TIMED_PRINTLN("Starting WiFi network scan...");
+    int n = WiFi.scanNetworks(false, true, false, 300); // async=false, show_hidden=true, passive=false, max_ms_per_chan=300
+    
+    if (n == WIFI_SCAN_FAILED) {
+        TIMED_PRINTLN("ERROR: WiFi scan failed!");
+        doc["error"] = "Scan failed - radio error";
+        doc["count"] = 0;
+    } else if (n == 0) {
+        TIMED_PRINTLN("No networks found in scan");
+        doc["message"] = "No networks found";
+        doc["count"] = 0;
+    } else {
+        TIMED_PRINTLN("WiFi scan found " + String(n) + " networks");
+        doc["count"] = n;
+        
+        for (int i = 0; i < n && i < 20; i++) { // Limit to 20 networks
+            String ssid = WiFi.SSID(i);
+            int rssi = WiFi.RSSI(i);
+            
+            // Skip networks with empty SSID (hidden networks without name)
+            if (ssid.length() == 0) {
+                ssid = "[Hidden Network]";
+            }
+            
+            JsonObject network = networks.add<JsonObject>();
+            network["ssid"] = ssid;
+            network["rssi"] = rssi;
+            network["secure"] = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
+            
+            // Debug output
+            TIMED_PRINTLN("  [" + String(i) + "] " + ssid + " (RSSI: " + String(rssi) + "dBm)");
+        }
+    }
+    
+    // Clean up scan results to free memory
+    WiFi.scanDelete();
+    
+    String response;
+    serializeJson(doc, response);
+    TIMED_PRINTLN("Sending scan response: " + response.substring(0, min(100, (int)response.length())) + "...");
+    
+    server.send(200, "application/json", response);
+    TIMED_PRINTLN("=== WiFi Scan Complete ===");
+}
+
+void handleWiFiSave() {
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"success\":false,\"message\":\"No data received\"}");
+        return;
+    }
+    
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, server.arg("plain"));
+    
+    if (error) {
+        server.send(400, "application/json", "{\"success\":false,\"message\":\"Invalid JSON\"}");
+        return;
+    }
+    
+    const char* newSSID = doc["ssid"];
+    const char* newPassword = doc["password"];
+    
+    if (!newSSID || strlen(newSSID) == 0) {
+        server.send(400, "application/json", "{\"success\":false,\"message\":\"SSID required\"}");
+        return;
+    }
+    
+    // Save credentials to config
+    strncpy(ssid, newSSID, sizeof(ssid) - 1);
+    ssid[sizeof(ssid) - 1] = '\0';
+    strncpy(password, newPassword ? newPassword : "", sizeof(password) - 1);
+    password[sizeof(password) - 1] = '\0';
+    
+    if (saveConfigSPIFFS()) {
+        TIMED_PRINTLN("WiFi credentials saved: " + String(ssid));
+        server.send(200, "application/json", "{\"success\":true,\"message\":\"Credentials saved\"}");
+        
+        delay(1000);
+        TIMED_PRINTLN("Restarting to connect to new WiFi...");
+        ESP.restart();
+    } else {
+        server.send(500, "application/json", "{\"success\":false,\"message\":\"Failed to save config\"}");
+    }
+}
+
+// Captive portal - redirect all unknown requests to WiFi config
+void handleCaptivePortal() {
+    if (isAPMode) {
+        // Redirect to config page
+        server.sendHeader("Location", "http://192.168.4.1/wificonfig", true);
+        server.send(302, "text/plain", "");
+    } else {
+        handleRoot(); // Normal operation
+    }
+}
+
 // Web server handlers
-void handleRoot() { 
-    server.send_P(200, "text/html", index_html); 
+void handleRoot() {
+    // If in AP mode, redirect to WiFi config
+    if (isAPMode) {
+        server.sendHeader("Location", "/wificonfig", true);
+        server.send(302, "text/plain", "");
+        return;
+    }
+     
+    // Try to serve from LittleFS first, fallback to built-in minimal page
+    if (LittleFS.exists("/index.html")) {
+        File file = LittleFS.open("/index.html", "r");
+        if (file) {
+            server.streamFile(file, "text/html");
+            file.close();
+            return;
+        }
+    }
+    
+    // Minimal fallback HTML page to save flash memory
+    String html = "<!DOCTYPE html><html><head><title>Energy Monitor</title><meta name='viewport' content='width=device-width, initial-scale=1'></head><body>";
+    html += "<h1>Energy Monitor</h1>";
+    html += "<p>Dashboard loading failed. Try <a href='/config'>Settings</a> or <a href='/test'>Test</a></p>";
+    html += "<script>setTimeout(() => location.reload(), 5000);</script>";
+    html += "</body></html>";
+    server.send(200, "text/html", html);
 }
 
 void handleJson() {
+    // Add performance headers
+    server.sendHeader("Cache-Control", "no-cache, max-age=0");
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    
     JsonDocument doc; // ArduinoJson v7 - no size needed
     
     doc["SheMeterName"] = ShemeterName;
+    
+    // Add uptime information
+    unsigned long uptimeSeconds = millis() / 1000;
+    doc["uptime"] = formatUptime(uptimeSeconds);
+    doc["uptimeSeconds"] = uptimeSeconds;
+    
+    // Add current time information
+    if (timeInitialized) {
+        doc["currentTime"] = myTZ.dateTime("Y-m-d H:i:s T");
+        doc["timezone"] = getTimezoneDisplayName(timezone);
+    } else {
+        doc["currentTime"] = "Time not synchronized";
+        doc["timezone"] = "Unknown";
+    }
+    
     JsonArray metersArray = doc["meters"].to<JsonArray>();
     
     for (int i = 0; i < 3; i++) {
@@ -449,12 +988,17 @@ void handleJson() {
 
 // Configuration management with ArduinoJson v7
 bool loadConfigSPIFFS() {
-    if (!SPIFFS.begin(true)) {
-        TIMED_PRINTLN("SPIFFS Mount Failed");
+    // Use LittleFS only (modern standard for ESP32)
+    if (!LittleFS.begin(true)) {
+        TIMED_PRINTLN("LittleFS mount failed");
         return false;
     }
+    TIMED_PRINTLN("LittleFS mounted successfully");
     
-    if (!SPIFFS.exists(configPath)) {
+    // Check for config file
+    bool configExists = LittleFS.exists(configPath);
+    
+    if (!configExists) {
         TIMED_PRINTLN("Config file not found. Initializing default configuration.");
         strncpy(ssid, defaultSSID, sizeof(ssid) - 1);
         ssid[sizeof(ssid) - 1] = '\0';
@@ -462,6 +1006,8 @@ bool loadConfigSPIFFS() {
         password[sizeof(password) - 1] = '\0';
         strncpy(shellyIP, defaultShellyIP, sizeof(shellyIP) - 1);
         shellyIP[sizeof(shellyIP) - 1] = '\0';
+        strncpy(timezone, defaultTimezone, sizeof(timezone) - 1);
+        timezone[sizeof(timezone) - 1] = '\0';
         meters[0].name = "Grid";
         meters[1].name = "Solar";
         meters[2].name = "Consumer";
@@ -470,7 +1016,9 @@ bool loadConfigSPIFFS() {
         return true;
     }
     
-    File file = SPIFFS.open(configPath, "r");
+    // Open config file from LittleFS
+    File file = LittleFS.open(configPath, "r");
+    
     if (!file) {
         TIMED_PRINTLN("Failed to open config file");
         return false;
@@ -490,17 +1038,24 @@ bool loadConfigSPIFFS() {
     const char* sp = doc["shellyIP"];
     const char* sheName = doc["shemeterName"];
     
-    strncpy(ssid, s ? s : defaultSSID, sizeof(ssid) - 1);
-    ssid[sizeof(ssid) - 1] = '\0';
-    strncpy(password, p ? p : defaultPassword, sizeof(password) - 1);
-    password[sizeof(password) - 1] = '\0';
-    strncpy(shellyIP, sp ? sp : defaultShellyIP, sizeof(shellyIP) - 1);
-    shellyIP[sizeof(shellyIP) - 1] = '\0';
-    ShemeterName = sheName ? String(sheName) : "SheMonitor";
+            strncpy(ssid, s ? s : defaultSSID, sizeof(ssid) - 1);
+        ssid[sizeof(ssid) - 1] = '\0';
+        strncpy(password, p ? p : defaultPassword, sizeof(password) - 1);
+        password[sizeof(password) - 1] = '\0';
+        strncpy(shellyIP, sp ? sp : defaultShellyIP, sizeof(shellyIP) - 1);
+        shellyIP[sizeof(shellyIP) - 1] = '\0';
+        ShemeterName = sheName ? String(sheName) : "SheMonitor";
+        
+        const char* tz = doc["timezone"];
+        strncpy(timezone, tz ? tz : defaultTimezone, sizeof(timezone) - 1);
+        timezone[sizeof(timezone) - 1] = '\0';
 
     if (doc["ledCount"].is<int>()) LED_COUNT_var = doc["ledCount"];
     if (doc["ledPin"].is<int>()) LED_PIN_var = doc["ledPin"];
-    if (doc["ledType"].is<uint32_t>()) LED_TYPE_flags = doc["ledType"];
+    if (doc["ledType"].is<uint32_t>()) {
+        LED_TYPE_flags = doc["ledType"];
+        currentLEDTypeIndex = findLEDTypeIndex(LED_TYPE_flags);
+    }
     if (doc["invertStrip"].is<bool>()) invertStrip = doc["invertStrip"];
 
     if (doc["meters"].is<JsonArray>()) {
@@ -527,10 +1082,15 @@ bool loadConfigSPIFFS() {
     // Validate configuration
     validateConfig();
 
-    TIMED_PRINTLN("Configuration loaded from SPIFFS:");
+    TIMED_PRINTLN("Configuration loaded from LittleFS:");
     TIMED_PRINTLN("SSID: " + String(ssid));
     TIMED_PRINTLN("Shelly IP: " + String(shellyIP));
     TIMED_PRINTLN("SheMeter Name: " + ShemeterName);
+    TIMED_PRINTLN("Timezone: " + getTimezoneDisplayName(timezone) + " (" + String(timezone) + ")");
+    TIMED_PRINTLN("LED Count: " + String(LED_COUNT_var));
+    TIMED_PRINTLN("LED Pin: " + String(LED_PIN_var));
+    TIMED_PRINTLN("LED Type: " + getLEDTypeName(LED_TYPE_flags) + " (0x" + String(LED_TYPE_flags, HEX) + ")");
+    TIMED_PRINTLN("LED Strip Inverted: " + String(invertStrip ? "Yes" : "No"));
     
     return true;
 }
@@ -542,9 +1102,11 @@ bool saveConfigSPIFFS() {
     doc["password"] = password;
     doc["shellyIP"] = shellyIP;
     doc["shemeterName"] = ShemeterName;
+    doc["timezone"] = timezone;
     doc["ledCount"] = LED_COUNT_var;
     doc["ledPin"] = LED_PIN_var;
     doc["ledType"] = LED_TYPE_flags;
+    doc["ledTypeName"] = getLEDTypeName(LED_TYPE_flags); // For debugging/readability
     doc["invertStrip"] = invertStrip;
     
     JsonArray meterArray = doc["meters"].to<JsonArray>();
@@ -552,7 +1114,13 @@ bool saveConfigSPIFFS() {
         meterArray.add(meters[i].name);
     }
     
-    File file = SPIFFS.open(configPath, "w");
+    // Save to LittleFS
+    if (!LittleFS.begin()) {
+        TIMED_PRINTLN("LittleFS not available for saving");
+        return false;
+    }
+    File file = LittleFS.open(configPath, "w");
+    
     if (!file) {
         TIMED_PRINTLN("Failed to open config file for writing");
         return false;
@@ -565,7 +1133,7 @@ bool saveConfigSPIFFS() {
     }
     
     file.close();
-    TIMED_PRINTLN("Configuration saved to SPIFFS.");
+    TIMED_PRINTLN("Configuration saved to LittleFS.");
     return true;
 }
 
@@ -576,6 +1144,7 @@ void handleConfig() {
         String newPassword = server.arg("password");
         String newShellyIP = server.arg("shellyIP");
         String newSheMeterName = server.arg("shemeterName");
+        String newTimezone = server.arg("timezone");
         String meter0Role = server.arg("meter0");
         String meter1Role = server.arg("meter1");
         String meter2Role = server.arg("meter2");
@@ -610,6 +1179,7 @@ void handleConfig() {
         // Validate LED configuration
         int newLedCount = ledCountStr.toInt();
         int newLedPin = ledPinStr.toInt();
+        uint32_t newLedType = (uint32_t)ledTypeStr.toInt();
         
         if (newLedCount < 1 || newLedCount > 300) {
             valid = false;
@@ -619,6 +1189,19 @@ void handleConfig() {
         if (newLedPin < 0 || newLedPin > 39) {
             valid = false;
             errorMsg = "LED pin must be between 0 and 39.";
+        }
+        
+        // Additional GPIO validation for ESP32-C3
+        if (valid && (newLedPin == 18 || newLedPin == 19)) {
+            valid = false;
+            errorMsg = "GPIO pins 18 and 19 are reserved for USB on ESP32-C3.";
+        }
+        
+        // Validate LED type
+        int ledTypeIndex = findLEDTypeIndex(newLedType);
+        if (ledTypeIndex == 0 && newLedType != LED_TYPES[0].flags) {
+            valid = false;
+            errorMsg = "Invalid LED type selected.";
         }
 
         // Check mDNS name availability
@@ -634,8 +1217,12 @@ void handleConfig() {
             newSSID.toCharArray(ssid, sizeof(ssid));
             newPassword.toCharArray(password, sizeof(password));
             newShellyIP.toCharArray(shellyIP, sizeof(shellyIP));
+            newTimezone.toCharArray(timezone, sizeof(timezone));
             ShemeterName = newSheMeterName;
             fallbackSSID = ShemeterName + "AP";
+            
+            // Update timezone
+            myTZ.setLocation(timezone);
 
             meters[0].name = meter0Role;
             meters[1].name = meter1Role;
@@ -644,7 +1231,8 @@ void handleConfig() {
             // Update LED configuration
             LED_COUNT_var = newLedCount;
             LED_PIN_var = newLedPin;
-            LED_TYPE_flags = (uint32_t)ledTypeStr.toInt();
+            LED_TYPE_flags = newLedType;
+            currentLEDTypeIndex = ledTypeIndex;
             invertStrip = ledInvert;
 
             // Reinitialize LED strip with new configuration
@@ -733,6 +1321,15 @@ void handleConfig() {
         html += "<div class='form-group'><label>Device Name</label><input type='text' name='shemeterName' value='" + String(ShemeterName) + "' required></div>";
         html += "</div>";
         
+        html += "<div class='form-row'>";
+        html += "<div class='form-group'><label>Timezone</label><select name='timezone' required>";
+        int currentTzIndex = findTimezoneIndex(timezone);
+        for (int i = 0; i < TIMEZONES_COUNT; i++) {
+            html += "<option value='" + String(TIMEZONES[i].olson) + "'" + (i == currentTzIndex ? " selected" : "") + ">" + String(TIMEZONES[i].name) + "</option>";
+        }
+        html += "</select></div>";
+        html += "</div>";
+        
         html += "<div class='section-title' style='margin-top: 30px;'>Meter Configuration</div>";
         for (int i = 0; i < 3; i++) {
             html += "<div class='meter-config'>";
@@ -750,17 +1347,34 @@ void handleConfig() {
         }
         
         html += "<div class='section-title' style='margin-top: 30px;'>LED Strip Configuration</div>";
-        html += "<div class='form-row'>";
-        html += "<div class='form-group'><label>LED Count</label><input type='number' name='ledCount' value='" + String(LED_COUNT_var) + "' min='1' max='300' required></div>";
-        html += "<div class='form-group'><label>LED Pin</label><input type='number' name='ledPin' value='" + String(LED_PIN_var) + "' min='0' max='39' required></div>";
+        html += "<div class='info-box' style='background: #e8f4f8; padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #2196F3;'>";
+        html += "<strong>LED Configuration Tips:</strong><br>";
+        html += "• Most common: WS2812B (RGB) or WS2812B (RGBW) for addressable LED strips<br>";
+        html += "• GPIO pins 18-19 are reserved for USB on ESP32-C3<br>";
+        html += "• Recommended pins: 2, 4, 5, 6, 7, 8, 10 (avoid ADC pins for better performance)<br>";
+        html += "• Maximum 300 LEDs supported (memory limitation)";
         html += "</div>";
         
         html += "<div class='form-row'>";
-        html += "<div class='form-group'><label>LED Type Flags</label><input type='text' name='ledType' value='" + String(LED_TYPE_flags) + "' required></div>";
+        html += "<div class='form-group'><label>LED Count <span style='color: #666; font-size: 0.9em;'>(1-300)</span></label><input type='number' name='ledCount' value='" + String(LED_COUNT_var) + "' min='1' max='300' required></div>";
+        html += "<div class='form-group'><label>LED Pin <span style='color: #666; font-size: 0.9em;'>(GPIO 0-39)</span></label><input type='number' name='ledPin' value='" + String(LED_PIN_var) + "' min='0' max='39' required></div>";
+        html += "</div>";
+        
+        html += "<div class='form-row'>";
+        html += "<div class='form-group'><label>LED IC Type</label><select name='ledType' required>";
+        for (int i = 0; i < LED_TYPES_COUNT; ++i) {
+            html += "<option value='" + String(LED_TYPES[i].flags) + "'" + (LED_TYPE_flags == LED_TYPES[i].flags ? " selected" : "") + ">" + String(LED_TYPES[i].description) + "</option>";
+        }
+        html += "</select></div>";
         html += "<div class='form-group' style='display: flex; align-items: center; padding-top: 30px;'>";
         html += "<input type='checkbox' name='invertStrip'" + String(invertStrip ? " checked" : "") + " style='width: auto; margin-right: 10px;'>";
-        html += "<label>Invert LED Strip</label>";
+        html += "<label style='margin: 0;'>Invert LED Strip Direction</label>";
         html += "</div>";
+        html += "</div>";
+        
+        html += "<div class='current-config' style='background: #f5f5f5; padding: 15px; border-radius: 8px; margin-top: 15px;'>";
+        html += "<strong>Current LED Configuration:</strong><br>";
+        html += "Type: " + getLEDTypeName(LED_TYPE_flags) + " | Count: " + String(LED_COUNT_var) + " | Pin: GPIO" + String(LED_PIN_var) + " | Inverted: " + String(invertStrip ? "Yes" : "No");
         html += "</div>";
         
         html += "<div style='margin-top: 30px;'>";
@@ -772,6 +1386,7 @@ void handleConfig() {
         // System Actions
         html += "<div class='card'>";
         html += "<div class='section-title'>System Actions</div>";
+        html += "<button type='button' class='btn btn-secondary' onclick='testLEDs()' style='margin-right: 10px;'>Test LED Strip</button>";
         html += "<button type='button' class='btn btn-secondary' onclick='checkDebugData()' style='margin-right: 10px;'>Debug Data</button>";
         html += "<form action='/ota' method='post' style='display: inline-block;'>";
         html += "<button type='submit' class='btn btn-secondary'>Check for Updates</button>";
@@ -785,6 +1400,16 @@ void handleConfig() {
         
         // Add the debug function JavaScript
         html += "<script>";
+        html += "function testLEDs() {";
+        html += "  fetch('/testLEDs')";
+        html += "    .then(response => response.text())";
+        html += "    .then(data => {";
+        html += "      alert('LED Test: ' + data);";
+        html += "    })";
+        html += "    .catch(error => {";
+        html += "      alert('LED Test failed: ' + error);";
+        html += "    });";
+        html += "}";
         html += "function checkDebugData() {";
         html += "  console.log('=== DEBUG DATA CHECK ===');";
         html += "  Promise.all([";
@@ -812,7 +1437,7 @@ void handleConfig() {
         html += "  });";
         html += "}";
         html += "</script>";
-        
+
         html += "</body></html>";
         server.send(200, "text/html", html);
     }
@@ -820,6 +1445,20 @@ void handleConfig() {
 
 // History handling with streaming for large datasets
 void handleHistory() {
+    // Add headers for better performance and caching control
+    server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    server.sendHeader("Pragma", "no-cache");
+    server.sendHeader("Expires", "0");
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    
+    // Check if client accepts gzip compression
+    String acceptEncoding = server.header("Accept-Encoding");
+    bool gzipSupported = acceptEncoding.indexOf("gzip") != -1;
+    
+    if (gzipSupported) {
+        server.sendHeader("Content-Encoding", "gzip");
+    }
+    
     server.setContentLength(CONTENT_LENGTH_UNKNOWN);
     server.send(200, "application/json", "");
     server.sendContent("[");
@@ -827,6 +1466,18 @@ void handleHistory() {
     bool first = true;
     int count = 0;
     int index = historyIndex;
+    int validPoints = 0;
+    
+    // First pass - count valid points for progress feedback
+    int tempIndex = historyIndex;
+    for (int i = 0; i < HISTORY_SIZE; i++) {
+        if (history[tempIndex].timestamp != 0) {
+            validPoints++;
+        }
+        tempIndex = (tempIndex + 1) % HISTORY_SIZE;
+    }
+    
+    TIMED_PRINTLN("Streaming " + String(validPoints) + " history points to client...");
     
     for (int i = 0; i < HISTORY_SIZE; i++) {
         DataPoint &dp = history[index];
@@ -840,6 +1491,7 @@ void handleHistory() {
         }
         first = false;
 
+        // Optimized timestamp format - use shorter format for better performance
         time_t seconds = (time_t)(dp.timestamp / 1000);
         int milliseconds = dp.timestamp % 1000;
         struct tm *timeinfo = localtime(&seconds);
@@ -848,33 +1500,70 @@ void handleHistory() {
         char fullTimestamp[24];
         sprintf(fullTimestamp, "%s%03d", timestampStr, milliseconds);
 
-        JsonDocument obj; // ArduinoJson v7
-        obj["timestamp"] = String(fullTimestamp);
-        obj["Grid"] = dp.grid;
-        obj["Solar"] = dp.solar;
-        obj["Consumer"] = dp.consumer;
-
-        String objStr;
-        serializeJson(obj, objStr);
+        // Use more compact JSON format
+        String objStr = "{\"timestamp\":\"" + String(fullTimestamp) + 
+                       "\",\"Grid\":" + String(dp.grid) + 
+                       ",\"Solar\":" + String(dp.solar) + 
+                       ",\"Consumer\":" + String(dp.consumer) + "}";
+        
         server.sendContent(objStr);
 
         index = (index + 1) % HISTORY_SIZE;
         count++;
         
-        if (count % 10 == 0) {
+        // Less frequent watchdog resets for better performance
+        if (count % 20 == 0) {
             esp_task_wdt_reset(); // Prevent watchdog timeout
+            yield(); // Allow other tasks to run
         }
     }
     
     server.sendContent("]");
+    TIMED_PRINTLN("History streaming completed: " + String(count) + " points sent");
 }
 
 // Web server setup
 void setupWebServer() {
+    // WiFi configuration portal routes (always available)
+    server.on("/wificonfig", handleWiFiConfig);
+    server.on("/wifiscan", handleWiFiScan);
+    server.on("/wifisave", HTTP_POST, handleWiFiSave);
+    
+    // Captive portal detection URLs - redirect to config
+    // These are requested by various devices to detect captive portals
+    server.on("/generate_204", handleCaptivePortal);          // Android
+    server.on("/gen_204", handleCaptivePortal);               // Android
+    server.on("/hotspot-detect.html", handleCaptivePortal);   // iOS/macOS
+    server.on("/canonical.html", handleCaptivePortal);        // Ubuntu
+    server.on("/connecttest.txt", handleCaptivePortal);       // Windows
+    server.on("/redirect", handleCaptivePortal);              // Windows
+    server.on("/success.txt", handleCaptivePortal);           // Firefox
+    server.on("/ncsi.txt", handleCaptivePortal);              // Windows NCSI
+    
+    // Main routes
     server.on("/", handleRoot);
     server.on("/data", handleJson);
     server.on("/config", handleConfig);
     server.on("/history", HTTP_GET, handleHistory);
+    
+    // Captive portal - catch all unknown requests
+    server.onNotFound(handleCaptivePortal);
+    
+    // Lightweight metrics endpoint for frequent polling (reduced payload)
+    server.on("/metrics", []() {
+        server.sendHeader("Cache-Control", "no-cache, max-age=0");
+        server.sendHeader("Access-Control-Allow-Origin", "*");
+        
+        // Minimal JSON for real-time updates
+        String response = "{\"meters\":[";
+        for (int i = 0; i < 3; i++) {
+            if (i > 0) response += ",";
+            response += "{\"name\":\"" + meters[i].name + "\",\"power\":" + String(meters[i].act_power) + "}";
+        }
+        response += "]}";
+        
+        server.send(200, "application/json", response);
+    });
     
     // Simple test endpoint
     server.on("/test", []() {
@@ -892,6 +1581,20 @@ void setupWebServer() {
         time(&now);
         doc["unixTime"] = now;
         
+        // Add ezTime information
+        unsigned long uptimeSeconds = millis() / 1000;
+        doc["uptime"] = formatUptime(uptimeSeconds);
+        doc["uptimeSeconds"] = uptimeSeconds;
+        doc["timezone"] = String(timezone);
+        doc["timezoneDisplay"] = getTimezoneDisplayName(timezone);
+        doc["timeInitialized"] = timeInitialized;
+        
+        if (timeInitialized) {
+            doc["currentTime"] = myTZ.dateTime("Y-m-d H:i:s T");
+            doc["utcTime"] = UTC.dateTime("Y-m-d H:i:s");
+            doc["epoch"] = myTZ.now();
+        }
+        
         String response;
         serializeJson(doc, response);
         server.send(200, "application/json", response);
@@ -908,6 +1611,20 @@ void setupWebServer() {
         doc["wsConnected"] = wsClient.available();
         doc["rpcInProgress"] = rpcInProgress;
         doc["newDataAvailable"] = newDataAvailable;
+        
+        // Add uptime information
+        unsigned long uptimeSeconds = millis() / 1000;
+        doc["uptime"] = formatUptime(uptimeSeconds);
+        doc["uptimeSeconds"] = uptimeSeconds;
+        
+        // Add timezone and time information
+        doc["timezone"] = String(timezone);
+        doc["timezoneDisplay"] = getTimezoneDisplayName(timezone);
+        doc["timeInitialized"] = timeInitialized;
+        if (timeInitialized) {
+            doc["currentTime"] = myTZ.dateTime("Y-m-d H:i:s T");
+            doc["utcTime"] = UTC.dateTime("Y-m-d H:i:s");
+        }
         
         JsonArray metersArray = doc["meters"].to<JsonArray>();
         for (int i = 0; i < 3; i++) {
@@ -941,14 +1658,148 @@ void setupWebServer() {
         handleOTA();
     });
     
+    server.on("/testLEDs", HTTP_GET, []() {
+        if (!strip) {
+            server.send(500, "text/plain", "LED strip not initialized");
+            return;
+        }
+        
+        TIMED_PRINTLN("Testing LED strip...");
+        
+        // Test sequence: Red, Green, Blue, White (if supported), then clear
+        uint32_t colors[] = {
+            strip->Color(255, 0, 0),    // Red
+            strip->Color(0, 255, 0),    // Green  
+            strip->Color(0, 0, 255),    // Blue
+            strip->Color(255, 255, 255) // White
+        };
+        
+        for (int c = 0; c < 4; c++) {
+            strip->fill(colors[c]);
+            strip->show();
+            delay(500);
+        }
+        
+        // Clear the strip
+        strip->clear();
+        strip->show();
+        
+        String response = "LED test completed successfully. ";
+        response += "Type: " + getLEDTypeName(LED_TYPE_flags) + ", ";
+        response += "Count: " + String(LED_COUNT_var) + ", ";
+        response += "Pin: GPIO" + String(LED_PIN_var);
+        
+        server.send(200, "text/plain", response);
+        TIMED_PRINTLN("LED test completed");
+    });
+    
     server.on("/factoryReset", HTTP_POST, []() {
-        SPIFFS.remove(configPath);
+        // Remove config from LittleFS
+        if (LittleFS.begin()) {
+            LittleFS.remove(configPath);
         TIMED_PRINTLN("Factory reset performed. Configuration cleared.");
+        }
         server.sendHeader("Location", "/config");
         server.send(303);
         delay(1000);
         ESP.restart();
     });
+    
+    // Debug endpoint to check LittleFS contents
+    server.on("/listfiles", []() {
+        if (!LittleFS.begin()) {
+            server.send(500, "text/plain", "LittleFS not mounted");
+            return;
+        }
+        
+        String output = "LittleFS Contents:\n\n";
+        File root = LittleFS.open("/");
+        File file = root.openNextFile();
+        while (file) {
+            output += String(file.isDirectory() ? "DIR: " : "FILE: ");
+            output += String(file.name());
+            if (!file.isDirectory()) {
+                output += " (" + String(file.size()) + " bytes)";
+            }
+            output += "\n";
+            file = root.openNextFile();
+        }
+        
+        // List JS directory specifically
+        output += "\n/js/ Directory:\n";
+        File jsDir = LittleFS.open("/js");
+        if (jsDir && jsDir.isDirectory()) {
+            File jsFile = jsDir.openNextFile();
+            while (jsFile) {
+                output += "  FILE: " + String(jsFile.name()) + " (" + String(jsFile.size()) + " bytes)\n";
+                jsFile = jsDir.openNextFile();
+            }
+        } else {
+            output += "  /js/ directory not found!\n";
+        }
+        
+        server.send(200, "text/plain", output);
+    });
+    
+    // Setup LittleFS and serve files
+    if (LittleFS.begin()) {
+        TIMED_PRINTLN("LittleFS mounted for static file serving");
+        
+        // Explicit handlers for JavaScript files with proper MIME type
+        server.on("/js/moment.min.js", []() {
+            TIMED_PRINTLN("Serving /js/moment.min.js");
+            File file = LittleFS.open("/js/moment.min.js", "r");
+            if (!file) {
+                TIMED_PRINTLN("ERROR: moment.min.js not found!");
+                server.send(404, "text/plain", "moment.min.js not found");
+                return;
+            }
+            server.streamFile(file, "application/javascript");
+            file.close();
+        });
+        
+        server.on("/js/chart.min.js", []() {
+            TIMED_PRINTLN("Serving /js/chart.min.js");
+            File file = LittleFS.open("/js/chart.min.js", "r");
+            if (!file) {
+                TIMED_PRINTLN("ERROR: chart.min.js not found!");
+                server.send(404, "text/plain", "chart.min.js not found");
+                return;
+            }
+            server.streamFile(file, "application/javascript");
+            file.close();
+        });
+        
+        server.on("/js/chartjs-adapter-moment.min.js", []() {
+            TIMED_PRINTLN("Serving /js/chartjs-adapter-moment.min.js");
+            File file = LittleFS.open("/js/chartjs-adapter-moment.min.js", "r");
+            if (!file) {
+                TIMED_PRINTLN("ERROR: chartjs-adapter-moment.min.js not found!");
+                server.send(404, "text/plain", "chartjs-adapter-moment.min.js not found");
+                return;
+            }
+            server.streamFile(file, "application/javascript");
+            file.close();
+        });
+        
+        server.on("/js/chartjs-plugin-zoom.min.js", []() {
+            TIMED_PRINTLN("Serving /js/chartjs-plugin-zoom.min.js");
+            File file = LittleFS.open("/js/chartjs-plugin-zoom.min.js", "r");
+            if (!file) {
+                TIMED_PRINTLN("ERROR: chartjs-plugin-zoom.min.js not found!");
+                server.send(404, "text/plain", "chartjs-plugin-zoom.min.js not found");
+                return;
+            }
+            server.streamFile(file, "application/javascript");
+            file.close();
+        });
+        
+        // Fallback: General static file serving with automatic MIME types
+        server.serveStatic("/js/", LittleFS, "/js/");
+        server.serveStatic("/", LittleFS, "/");
+    } else {
+        TIMED_PRINTLN("LittleFS mount failed for static serving");
+    }
     
     server.begin();
     TIMED_PRINTLN("HTTP server started on port 80");
@@ -1146,6 +1997,11 @@ bool startUniqueMDNS(String& name) {
 }
 
 void checkAndEstablishWebSocket() {
+    // Don't attempt WebSocket operations if WiFi isn't connected
+    if (WiFi.status() != WL_CONNECTED) {
+        return;
+    }
+    
     unsigned long now = millis();
     if (now - lastWebSocketAttempt < webSocketRetryInterval) {
         return;
@@ -1233,7 +2089,7 @@ void updateEnergyMeterData() {
 // OTA Update Support
 void setupOTA() {
     ArduinoOTA.setHostname(ShemeterName.c_str());
-    ArduinoOTA.setPassword("ShellyOTA123"); // Change this to a secure password
+    // ArduinoOTA.setPassword("password"); // Password disabled for easier updates
     
     ArduinoOTA.onStart([]() {
         String type;
@@ -1279,10 +2135,30 @@ void handleOTA() {
 // Main setup function
 void setup() {
     Serial.begin(115200);
+    delay(2000);  // Give serial time to initialize
+    
+    // Print boot diagnostics
+    TIMED_PRINTLN("=== ENERGY MONITOR BOOT DIAGNOSTICS ===");
+    TIMED_PRINTLN("ESP32-C3 Reset Reason: " + String(esp_reset_reason()));
+    TIMED_PRINTLN("Free heap: " + String(ESP.getFreeHeap()) + " bytes");
+    TIMED_PRINTLN("Flash size: " + String(ESP.getFlashChipSize()) + " bytes");
+    TIMED_PRINTLN("Free sketch space: " + String(ESP.getFreeSketchSpace()) + " bytes");
+    TIMED_PRINTLN("Chip revision: " + String(ESP.getChipRevision()));
+    TIMED_PRINTLN("SDK version: " + String(ESP.getSdkVersion()));
+    
+    // Check for potential issues
+    if (ESP.getFreeHeap() < 50000) {
+        TIMED_PRINTLN("WARNING: Low free heap memory detected!");
+    }
+    if (ESP.getFreeSketchSpace() < 100000) {
+        TIMED_PRINTLN("WARNING: Low free flash space detected!");
+    }
 
-    // Initialize watchdog timer
-    esp_task_wdt_init(60, true);
+    // Initialize watchdog timer with more conservative settings for ESP32-C3
+    esp_task_wdt_init(30, true);  // Reduced from 60 to 30 seconds for faster detection
     esp_task_wdt_add(NULL);
+    
+    TIMED_PRINTLN("Watchdog timer initialized (30s timeout)");
 
     // Initialize status LED
 #ifdef USE_WS2812B_FOR_STATUS
@@ -1302,47 +2178,30 @@ void setup() {
     // Initialize LED strip with loaded configuration
     initializeLEDStrip();
 
-    TIMED_PRINTLN("Attempting to connect using stored WiFi credentials...");
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(ssid, password);
-    delay(3500);
+    // Check if we have valid WiFi credentials
+    bool hasValidCredentials = (strlen(ssid) > 0 && strlen(ssid) < 32);
 
-    if (WiFi.status() != WL_CONNECTED) {
-        TIMED_PRINTLN("Stored WiFi credentials failed. Starting SmartConfig...");
-        WiFi.mode(WIFI_AP_STA);
-        WiFi.beginSmartConfig();
-        unsigned long smartconfigStart = millis();
+    if (hasValidCredentials) {
+        TIMED_PRINTLN("Found stored WiFi credentials. Attempting connection...");
+        TIMED_PRINTLN("SSID: " + String(ssid));
         
-        while (!WiFi.smartConfigDone() && (millis() - smartconfigStart) < 300000) {
-            delay(500);
-            esp_task_wdt_reset();
-            Serial.print(".");
-        }
-        
-        if (WiFi.smartConfigDone()) {
-            TIMED_PRINTLN("SmartConfig successful.");
-            while (WiFi.status() != WL_CONNECTED) {
-                delay(500);
-                esp_task_wdt_reset();
-                Serial.print(".");
-            }
-            TIMED_PRINTLN("WiFi Connected.");
-            TIMED_PRINTLN(String("IP: ") + WiFi.localIP().toString());
-            
-            strncpy(ssid, WiFi.SSID().c_str(), sizeof(ssid) - 1);
-            ssid[sizeof(ssid) - 1] = '\0';
-            strncpy(password, WiFi.psk().c_str(), sizeof(password) - 1);
-            password[sizeof(password) - 1] = '\0';
-            saveConfigSPIFFS();
+        if (tryConnectWiFi(ssid, password)) {
+            TIMED_PRINTLN("WiFi Connected using stored credentials.");
+            TIMED_PRINTLN("IP: " + WiFi.localIP().toString());
         } else {
-            TIMED_PRINTLN("SmartConfig failed. Starting fallback AP mode.");
-            WiFi.mode(WIFI_AP);
-            WiFi.softAP(fallbackSSID.c_str(), fallbackPWD);
-            TIMED_PRINTLN("Access Point started: " + fallbackSSID);
-            TIMED_PRINTLN("AP IP: " + WiFi.softAPIP().toString());
+            TIMED_PRINTLN("Stored WiFi credentials failed to connect.");
+            hasValidCredentials = false;
         }
     } else {
-        TIMED_PRINTLN("WiFi Connected using stored credentials.");
+        TIMED_PRINTLN("No valid WiFi credentials found in storage.");
+    }
+    
+    // If no valid credentials or connection failed, start AP mode for configuration
+    if (!hasValidCredentials) {
+        TIMED_PRINTLN("No working WiFi credentials. Starting Access Point for configuration...");
+        TIMED_PRINTLN("Connect to WiFi network: " + fallbackSSID + " (no password)");
+        TIMED_PRINTLN("Then navigate to: http://192.168.4.1/config");
+        startAPMode();
     }
 
     if (WiFi.status() == WL_CONNECTED) {
@@ -1352,15 +2211,22 @@ void setup() {
         TIMED_PRINTLN("Subnet: " + WiFi.subnetMask().toString());
         TIMED_PRINTLN("DNS: " + WiFi.dnsIP().toString());
 
-        // Initialize time
-        configTime(36000, 0, "au.pool.ntp.org");
-        struct tm timeinfo;
-        while (!getLocalTime(&timeinfo)) {
-            TIMED_PRINTLN("Waiting for time sync...");
-            delay(1000);
+        // Initialize ezTime
+        TIMED_PRINTLN("Initializing time synchronization...");
+        setDebug(INFO);
+        waitForSync();
+        
+        // Set timezone
+        if (myTZ.setLocation(timezone)) {
+            TIMED_PRINTLN("Timezone set to: " + getTimezoneDisplayName(timezone));
+            TIMED_PRINTLN("Current time: " + myTZ.dateTime("Y-m-d H:i:s T"));
+            timeInitialized = true;
+        } else {
+            TIMED_PRINTLN("Failed to set timezone: " + String(timezone));
+            timeInitialized = false;
         }
-        deviceStartTimeMillis = ((uint64_t)mktime(&timeinfo)) * 1000 + millis();
-        TIMED_PRINTLN("Device start time initialized: " + String(mktime(&timeinfo)));
+        
+        startTime = millis();
 
         inSetup = false;  // End setup phase
 
@@ -1374,17 +2240,28 @@ void setup() {
             TIMED_PRINTLN("mDNS responder failed to start.");
         }
 
-        // Discover and connect to Shelly devices
+        // Setup web server for connected WiFi (only if not already running from AP mode)
+        if (WiFi.getMode() != WIFI_AP) {
+            isAPMode = false;  // Normal WiFi mode
+            setupWebServer();
+            TIMED_PRINTLN("Web server started for WiFi connection");
+        }
+        
+        // Discover and connect to Shelly devices ONLY when WiFi is connected
+        TIMED_PRINTLN("WiFi connected - starting Shelly device discovery...");
         discoverShellyDevices();
             } else {
         TIMED_PRINTLN("WiFi not connected, current status: " + String(WiFi.status()));
+        TIMED_PRINTLN("Skipping Shelly device discovery - no network connection");
+        inSetup = false;  // End setup phase even without WiFi
     }
 
     // Setup WebSocket handlers
     wsClient.onMessage(onMessageCallback);
     wsClient.onEvent(handleWebSocketEvent);
 
-    // Initial connection attempt
+    // Initial connection attempt ONLY if WiFi is connected
+    if (WiFi.status() == WL_CONNECTED) {
     if (isValidShellyIP(shellyIP)) {
         String wsUrl = String("ws://") + shellyIP + "/rpc";
         TIMED_PRINTLN("Connecting to WebSocket at: " + wsUrl);
@@ -1396,29 +2273,49 @@ void setup() {
             TIMED_PRINTLN("Failed to connect to Shelly WebSocket");
         }
     } else {
-        TIMED_PRINTLN("No valid Shelly IP available. Will discover devices.");
+            TIMED_PRINTLN("No valid Shelly IP available. Will discover devices when WiFi connects.");
+    }
+    } else {
+        TIMED_PRINTLN("Skipping Shelly WebSocket connection - WiFi not connected");
     }
 
-    // Always setup web server (works in both STA and AP modes)
-    setupWebServer();
+    // Web server will be started by WiFi connection or AP mode functions
     
-    TIMED_PRINTLN("Setup complete. System ready.");
+    TIMED_PRINTLN("=== SETUP COMPLETE - NO RESET LOOP DETECTED ===");
+    TIMED_PRINTLN("System ready and stable!");
+    TIMED_PRINTLN("Free heap after setup: " + String(ESP.getFreeHeap()) + " bytes");
+    if (WiFi.status() == WL_CONNECTED) {
+        TIMED_PRINTLN("Device accessible at: http://" + WiFi.localIP().toString());
+    } else if (WiFi.getMode() == WIFI_AP) {
+        TIMED_PRINTLN("Device accessible at: http://" + WiFi.softAPIP().toString() + " (AP Mode)");
+        TIMED_PRINTLN("Configuration page at: http://" + WiFi.softAPIP().toString() + "/config");
+    } else {
+        TIMED_PRINTLN("Device accessible at: http://0.0.0.0 (No network connection)");
+    }
+    TIMED_PRINTLN("=== END BOOT DIAGNOSTICS ===");
 }
 
 // Main loop
 void loop() {
     unsigned long currentMillis = millis();
 
+    // Handle DNS requests for captive portal when in AP mode
+    if (isAPMode) {
+        dnsServer.processNextRequest();
+    }
+
     // Handle OTA updates
     handleOTA();
 
-    // Data update cycle
+    // Data update cycle - only if WiFi is connected
     if (currentMillis - previousMillis >= dataUpdateInterval) {
         previousMillis = currentMillis;
+        if (WiFi.status() == WL_CONNECTED) {
         if (!wsClient.available()) {
             checkAndEstablishWebSocket();
         } else {
             updateEnergyMeterData();
+            }
         }
     }
 
@@ -1427,11 +2324,13 @@ void loop() {
         blinkPWMLED(LED_STATUS_PIN, 500, 1);
     }
 
-    // Network health monitoring
+    // Network health monitoring - only if WiFi is connected
     if (currentMillis - lastNetworkHealthCheck >= NETWORK_HEALTH_CHECK_INTERVAL) {
         lastNetworkHealthCheck = currentMillis;
+        if (WiFi.status() == WL_CONNECTED) {
         monitorNetworkHealth();
         checkWebSocketHealth();
+        }
     }
 
     // Update display when new data is available
@@ -1463,5 +2362,9 @@ void loop() {
     checkWiFiConnection();
     esp_task_wdt_reset();
     wsClient.poll();
+    
+    // Handle ezTime events
+    events();
+    
     delay(loopDelay);
 }
