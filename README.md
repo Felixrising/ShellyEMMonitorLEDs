@@ -23,7 +23,12 @@ This device aims to assist homeowners in optimizing their use of renewable energ
 * Provides an interactive web interface for historical data visualization
 * Features an intuitive LED strip display for immediate energy status feedback
 
-### New in Version 2.0
+### New in Version 2.0-RC1
+* **Interactive Chart.js Dashboard**: Real-time and historical energy visualization with zoom/pan capabilities
+* **WiFi Out-of-Box Experience**: Automatic AP mode with captive portal for easy first-time setup
+* **Enhanced WiFi Management**: AP+STA mode for network scanning while hosting configuration portal
+* **Automatic Reconnection**: 5-minute retry intervals in AP mode for automatic recovery
+* **LED Strip Direction Control**: Invert strip direction option for flexible installation
 * **ArduinoJson v7 Support**: Modern dynamic JSON allocation for better memory management
 * **Dual Device Support**: Compatible with both Shelly Pro 3EM and dual single-phase Shelly EM setups
 * **Enhanced API Compatibility**: Supports both triphase and monophase profiles
@@ -42,34 +47,55 @@ This device aims to assist homeowners in optimizing their use of renewable energ
 
 ## Software Dependencies
 
+### Firmware Libraries
 * **ArduinoJson** (v7.4.2 or later) - Modern JSON handling with dynamic allocation
 * **Adafruit NeoPixel** (v1.10.0 or later) - LED strip control
 * **ArduinoWebsockets** - WebSocket communication with Shelly devices
 * **ESP32Ping** - Network health monitoring
 * **ArduinoOTA** - Over-the-air updates
-* **EEPROM/SPIFFS** - Configuration storage
+* **ezTime** - NTP time synchronization
+* **LittleFS** - Filesystem for web assets
+
+### Web Interface Libraries (Included)
+* **Chart.js** (v4.4.1 UMD) - Interactive data visualization
+* **Moment.js** - Time formatting and manipulation
+* **chartjs-adapter-moment** - Time scale adapter for Chart.js
+* **chartjs-plugin-zoom** - Zoom and pan functionality
 
 ## Configuration and Setup
 
 ### Initial Setup
 1. Flash the firmware to your ESP32 board using PlatformIO
 2. Connect the LED strip to the configured GPIO pin (default: GPIO 4)
-3. Power on the device - it will create a WiFi access point
-4. Connect to the AP and configure WiFi credentials via SmartConfig or web interface
-5. Access the web interface to configure Shelly device settings
+3. Power on the device - it will automatically create a WiFi access point named "SheMonitorAP"
+4. Connect to the AP (no password required) - your device should automatically open the captive portal
+5. Scan and select your WiFi network from the list
+6. Enter your WiFi password and save
+7. Device will restart and connect to your network
+8. Access the web interface at `http://shemonitor.local` or via the device's IP address
+9. Configure Shelly device settings via the configuration page
 
-### Web Configuration
-Access the device's web interface at `http://[device-ip]/config` to configure:
+### Web Interface
 
-* **WiFi Settings**: SSID and password
-* **Shelly Device**: IP address or hostname
-* **Device Name**: mDNS hostname for the device
+#### Interactive Dashboard
+Access the main dashboard at `http://shemonitor.local` or `http://[device-ip]` to view:
+* **Real-time Energy Display**: Live Grid, Solar, and Consumption metrics
+* **Interactive Chart**: Historical energy data with zoom and pan capabilities
+* **Time-series Visualization**: Powered by Chart.js with moment.js time adapter
+* **Responsive Design**: Works on desktop and mobile devices
+
+#### Configuration Page
+Access the configuration page at `http://[device-ip]/config` to configure:
+
+* **WiFi Settings**: SSID and password with network scanning
+* **Shelly Device**: IP address or hostname with automatic discovery
+* **Device Name**: mDNS hostname for the device (default: shemonitor)
 * **Meter Assignments**: Configure which physical meter corresponds to Grid/Solar/Consumer
 * **LED Strip Settings**: 
   * Number of LEDs (1-300)
   * GPIO pin (0-39)
-  * LED type flags
-  * Strip inversion option
+  * LED type (WS2812B RGB/RGBW, SK6812, etc.)
+  * **Invert Strip Direction**: Reverse LED drawing order for flexible installation
 
 ### Automatic Discovery
 The device automatically discovers Shelly devices on the network using mDNS. Supported devices:
@@ -147,20 +173,40 @@ Configure using `USE_WS2812B_FOR_STATUS` define:
 
 1. **Device Not Connecting to WiFi**
    - Check credentials in web interface
-   - Try SmartConfig setup
-   - Verify network compatibility
+   - Connect to "SheMonitorAP" access point
+   - Verify network compatibility (2.4GHz only)
+   - Device will retry every 5 minutes in AP mode
 
-2. **LED Strip Not Working**
+2. **WiFi Network Scan Shows No Networks**
+   - Ensure you're connected to the SheMonitorAP
+   - Try the "Retry Scan" button
+   - Device uses AP+STA mode for scanning
+   - Check that 2.4GHz WiFi is enabled on your router
+
+3. **Chart Not Displaying on Dashboard**
+   - Clear browser cache (Ctrl+F5)
+   - Check browser console (F12) for JavaScript errors
+   - Verify Chart.js libraries loaded at `/listfiles`
+   - Ensure using IP address instead of .local if issues persist
+
+4. **LED Strip Not Working**
    - Verify GPIO pin configuration
    - Check LED count and type settings
-   - Ensure adequate power supply
+   - Ensure adequate power supply (5V, sufficient amperage)
+   - Test with `/testLEDs` endpoint
 
-3. **Shelly Device Not Found**
+5. **LED Strip Direction is Reversed**
+   - Enable "Invert Strip Direction" in configuration
+   - Changes take effect immediately
+   - No reboot required
+
+6. **Shelly Device Not Found**
    - Check IP address configuration
    - Verify network connectivity
-   - Try automatic discovery
+   - Try automatic discovery via mDNS
+   - Ensure Shelly device is on the same network
 
-4. **Periodic Crashes (Fixed in v2.0)**
+7. **Periodic Crashes (Fixed in v2.0)**
    - Update to latest firmware
    - Check memory usage
    - Monitor serial output for errors
@@ -230,9 +276,30 @@ This open-source project welcomes contributions to improve functionality and usa
 
 ## Version History
 
-### Version 2.0 (Current)
+### Version 2.0-RC1 (Current - Release Candidate)
+**New Features:**
+- Interactive Chart.js dashboard with zoom/pan
+- WiFi out-of-box experience with captive portal
+- AP+STA mode for network scanning in AP mode
+- Automatic WiFi reconnection (5-minute intervals)
+- LED strip direction inversion support
+- Debug endpoints (`/listfiles`, `/testLEDs`)
+
+**Improvements:**
+- Chart.js UMD versions for browser compatibility
+- Enhanced WiFi scan with error handling
+- Captive portal detection URL handlers
+- Better JavaScript error logging
+
+**Bug Fixes:**
+- Fixed WiFi network scanning in AP mode
+- Fixed Chart.js loading (ES module → UMD)
+- Fixed LED strip inversion not working
+- Improved error messages and user feedback
+
+### Version 2.0 (Development)
 - ArduinoJson v7 compatibility
-- Dual device support
+- Dual device support (Pro 3EM + Shelly EM)
 - OTA updates
 - Enhanced stability
 - Memory optimization
@@ -254,4 +321,8 @@ For issues, questions, or contributions:
 
 ---
 
-**Note**: This is production-ready firmware with comprehensive error handling and stability improvements. The periodic crash issues from earlier versions have been resolved through proper memory management, timeout handling, and network resilience features.
+**Note**: Version 2.0-RC1 is a release candidate featuring significant improvements to WiFi management, web interface, and LED control. This build includes comprehensive error handling, enhanced user experience, and stability improvements. The periodic crash issues from earlier versions have been resolved through proper memory management, timeout handling, and network resilience features.
+
+**Getting Started**: Flash the firmware, connect to "SheMonitorAP", configure your WiFi, and access the interactive dashboard at `http://shemonitor.local`
+
+**Feedback Welcome**: Please report any issues or suggestions on the GitHub repository.
