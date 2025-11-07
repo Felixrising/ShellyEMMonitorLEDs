@@ -53,8 +53,8 @@
       const scriptsToLoad = [
         '/js/moment.min.js',
         '/js/chart.umd.js', 
-        '/js/chartjs-adapter-moment.umd.js',
-        '/js/chartjs-plugin-zoom.umd.js'
+        '/js/chartjs-adapter-moment.min.js',
+        '/js/chartjs-plugin-zoom.min.js'
       ];
       
       function loadNextScript(index = 0) {
@@ -362,24 +362,6 @@
         backdrop-filter: blur(5px);
       ">Connected</div>
       
-      <!-- mDNS Notice (shown only when using .local hostname) -->
-      <div id="mdnsNotice" style="
-        position: fixed;
-        top: 50px;
-        right: 10px;
-        max-width: 300px;
-        padding: 10px;
-        background: #ffc107;
-        color: #856404;
-        border: 1px solid #ffca2c;
-        border-radius: 5px;
-        font-size: 12px;
-        z-index: 1000;
-        display: none;
-      ">
-        <strong>Using mDNS (.local):</strong> If the graph doesn't load or updates are slow, try using the IP address instead: <a href="#" id="ipLink" style="color: #856404; text-decoration: underline;"></a>
-      </div>
-
     </div>
 
   <script>
@@ -391,25 +373,6 @@
     // Connection management
     let connectionFailures = 0;
     let lastSuccessfulFetch = Date.now();
-    
-    // Detect if using mDNS and show notice
-    if (window.location.hostname.endsWith('.local')) {
-      document.getElementById('mdnsNotice').style.display = 'block';
-      document.getElementById('ipLink').innerText = window.location.hostname.replace('.local', '') + ' IP';
-      document.getElementById('ipLink').onclick = function() {
-        // Try to get IP from current data
-        fetch('/test').then(r => r.text()).then(text => {
-          const ipMatch = text.match(/IP: (\d+\.\d+\.\d+\.\d+)/);
-          if (ipMatch) {
-            const newUrl = window.location.protocol + '//' + ipMatch[1] + window.location.pathname;
-            window.location.href = newUrl;
-          }
-        }).catch(() => {
-          alert('Could not determine IP address. Check the device configuration page.');
-        });
-        return false;
-      };
-    }
     
     function updateConnectionStatus(status, message) {
       const statusEl = document.getElementById('connectionStatus');
@@ -994,10 +957,6 @@
       const checkLibraries = () => {
         if (chartLibrariesReady && typeof Chart !== 'undefined' && typeof moment !== 'undefined') {
           initializeApp();
-        } else if (scriptsLoaded === scriptsTotal && !chartLibrariesReady) {
-          // Libraries failed to load
-          console.error('Chart.js libraries failed to load properly');
-          showCDNError();
         } else {
           // Still waiting for libraries
           setTimeout(checkLibraries, 100);

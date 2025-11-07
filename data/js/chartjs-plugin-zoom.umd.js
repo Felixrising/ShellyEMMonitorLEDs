@@ -1,1 +1,0 @@
-Couldn't find the requested file /dist/chartjs-plugin-zoom.umd.js in chartjs-plugin-zoom.

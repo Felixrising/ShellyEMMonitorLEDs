@@ -10,6 +10,7 @@
 #include <ESP32Ping.h>
 #include <ArduinoOTA.h>
 #include <ezTime.h>
+#include <Preferences.h>
 #include <map>
 #include <vector>
 #include "includes.h"
@@ -129,7 +130,9 @@ DNSServer dnsServer;
 WebsocketsClient wsClient;
 bool isAPMode = false;  // Track if we're in AP mode for captive portal
 
-const char* configPath = "/config.json";
+// Preferences for NVS storage (persists across filesystem uploads)
+Preferences preferences;
+const char* NVS_NAMESPACE = "shemonitor";
 
 // RPC request management with timeout support
 struct PendingRequest { 
@@ -233,8 +236,9 @@ int scaledBrightness();
 void displayMetricsOnStrip();
 void handleRoot();
 void handleJson();
-bool loadConfigSPIFFS();
-bool saveConfigSPIFFS();
+bool loadConfig();
+bool saveConfig();
+void factoryReset();
 void handleConfig();
 void setupWebServer();
 void checkWiFiConnection();
@@ -899,7 +903,7 @@ void handleWiFiSave() {
     strncpy(password, newPassword ? newPassword : "", sizeof(password) - 1);
     password[sizeof(password) - 1] = '\0';
     
-    if (saveConfigSPIFFS()) {
+    if (saveConfig()) {
         TIMED_PRINTLN("WiFi credentials saved: " + String(ssid));
         server.send(200, "application/json", "{\"success\":true,\"message\":\"Credentials saved\"}");
         
@@ -986,20 +990,28 @@ void handleJson() {
     server.send(200, "application/json", response);
 }
 
-// Configuration management with ArduinoJson v7
-bool loadConfigSPIFFS() {
-    // Use LittleFS only (modern standard for ESP32)
+// Configuration management using NVS (Non-Volatile Storage)
+// NVS persists across filesystem uploads, unlike LittleFS
+bool loadConfig() {
+    // Mount LittleFS for web assets
     if (!LittleFS.begin(true)) {
         TIMED_PRINTLN("LittleFS mount failed");
         return false;
     }
     TIMED_PRINTLN("LittleFS mounted successfully");
     
-    // Check for config file
-    bool configExists = LittleFS.exists(configPath);
+    // Open NVS namespace
+    if (!preferences.begin(NVS_NAMESPACE, true)) { // true = read-only for loading
+        TIMED_PRINTLN("Failed to open NVS namespace");
+        return false;
+    }
+    
+    // Check if config exists (isKey checks for existence)
+    bool configExists = preferences.isKey("ssid");
     
     if (!configExists) {
-        TIMED_PRINTLN("Config file not found. Initializing default configuration.");
+        preferences.end();
+        TIMED_PRINTLN("Config not found in NVS. Initializing default configuration.");
         strncpy(ssid, defaultSSID, sizeof(ssid) - 1);
         ssid[sizeof(ssid) - 1] = '\0';
         strncpy(password, defaultPassword, sizeof(password) - 1);
@@ -1012,77 +1024,39 @@ bool loadConfigSPIFFS() {
         meters[1].name = "Solar";
         meters[2].name = "Consumer";
         ShemeterName = "SheMonitor";
-        saveConfigSPIFFS();
+        LED_COUNT_var = 60;
+        LED_PIN_var = 4;
+        LED_TYPE_flags = NEO_GRBW + NEO_KHZ800;
+        invertStrip = false;
+        saveConfig();
         return true;
     }
     
-    // Open config file from LittleFS
-    File file = LittleFS.open(configPath, "r");
+    // Load configuration from NVS
+    preferences.getString("ssid", ssid, sizeof(ssid));
+    preferences.getString("password", password, sizeof(password));
+    preferences.getString("shellyIP", shellyIP, sizeof(shellyIP));
+    ShemeterName = preferences.getString("shemeterName", "SheMonitor");
+    preferences.getString("timezone", timezone, sizeof(timezone));
     
-    if (!file) {
-        TIMED_PRINTLN("Failed to open config file");
-        return false;
-    }
+    // LED configuration
+    LED_COUNT_var = preferences.getInt("ledCount", 60);
+    LED_PIN_var = preferences.getInt("ledPin", 4);
+    LED_TYPE_flags = preferences.getUInt("ledType", NEO_GRBW + NEO_KHZ800);
+    currentLEDTypeIndex = findLEDTypeIndex(LED_TYPE_flags);
+    invertStrip = preferences.getBool("invertStrip", false);
     
-    JsonDocument doc; // ArduinoJson v7 - automatic sizing
-    DeserializationError error = deserializeJson(doc, file);
-    file.close();
+    // Meter names
+    meters[0].name = preferences.getString("meter0", "Grid");
+    meters[1].name = preferences.getString("meter1", "Solar");
+    meters[2].name = preferences.getString("meter2", "Consumer");
     
-    if (error) {
-        TIMED_PRINTLN("Failed to parse config file: " + String(error.c_str()));
-        return false;
-    }
-    
-    const char* s = doc["ssid"];
-    const char* p = doc["password"];
-    const char* sp = doc["shellyIP"];
-    const char* sheName = doc["shemeterName"];
-    
-            strncpy(ssid, s ? s : defaultSSID, sizeof(ssid) - 1);
-        ssid[sizeof(ssid) - 1] = '\0';
-        strncpy(password, p ? p : defaultPassword, sizeof(password) - 1);
-        password[sizeof(password) - 1] = '\0';
-        strncpy(shellyIP, sp ? sp : defaultShellyIP, sizeof(shellyIP) - 1);
-        shellyIP[sizeof(shellyIP) - 1] = '\0';
-        ShemeterName = sheName ? String(sheName) : "SheMonitor";
-        
-        const char* tz = doc["timezone"];
-        strncpy(timezone, tz ? tz : defaultTimezone, sizeof(timezone) - 1);
-        timezone[sizeof(timezone) - 1] = '\0';
-
-    if (doc["ledCount"].is<int>()) LED_COUNT_var = doc["ledCount"];
-    if (doc["ledPin"].is<int>()) LED_PIN_var = doc["ledPin"];
-    if (doc["ledType"].is<uint32_t>()) {
-        LED_TYPE_flags = doc["ledType"];
-        currentLEDTypeIndex = findLEDTypeIndex(LED_TYPE_flags);
-    }
-    if (doc["invertStrip"].is<bool>()) invertStrip = doc["invertStrip"];
-
-    if (doc["meters"].is<JsonArray>()) {
-        JsonArray meterArray = doc["meters"].as<JsonArray>();
-        int index = 0;
-        for (JsonVariant meterName : meterArray) {
-            if (index < 3 && meterName.is<const char*>()) {
-                meters[index].name = String(meterName.as<const char*>());
-                index++;
-            }
-        }
-        while (index < 3) {
-            if (index == 0) meters[index].name = "Grid";
-            else if (index == 1) meters[index].name = "Solar";
-            else meters[index].name = "Consumer";
-            index++;
-        }
-    } else {
-        meters[0].name = "Grid";
-        meters[1].name = "Solar";
-        meters[2].name = "Consumer";
-    }
+    preferences.end();
 
     // Validate configuration
     validateConfig();
 
-    TIMED_PRINTLN("Configuration loaded from LittleFS:");
+    TIMED_PRINTLN("Configuration loaded from NVS:");
     TIMED_PRINTLN("SSID: " + String(ssid));
     TIMED_PRINTLN("Shelly IP: " + String(shellyIP));
     TIMED_PRINTLN("SheMeter Name: " + ShemeterName);
@@ -1095,46 +1069,52 @@ bool loadConfigSPIFFS() {
     return true;
 }
 
-bool saveConfigSPIFFS() {
-    JsonDocument doc; // ArduinoJson v7
-    
-    doc["ssid"] = ssid;
-    doc["password"] = password;
-    doc["shellyIP"] = shellyIP;
-    doc["shemeterName"] = ShemeterName;
-    doc["timezone"] = timezone;
-    doc["ledCount"] = LED_COUNT_var;
-    doc["ledPin"] = LED_PIN_var;
-    doc["ledType"] = LED_TYPE_flags;
-    doc["ledTypeName"] = getLEDTypeName(LED_TYPE_flags); // For debugging/readability
-    doc["invertStrip"] = invertStrip;
-    
-    JsonArray meterArray = doc["meters"].to<JsonArray>();
-    for (int i = 0; i < 3; i++) {
-        meterArray.add(meters[i].name);
-    }
-    
-    // Save to LittleFS
-    if (!LittleFS.begin()) {
-        TIMED_PRINTLN("LittleFS not available for saving");
-        return false;
-    }
-    File file = LittleFS.open(configPath, "w");
-    
-    if (!file) {
-        TIMED_PRINTLN("Failed to open config file for writing");
+bool saveConfig() {
+    // Open NVS namespace for writing
+    if (!preferences.begin(NVS_NAMESPACE, false)) { // false = read-write mode
+        TIMED_PRINTLN("Failed to open NVS namespace for writing");
         return false;
     }
     
-    if (serializeJson(doc, file) == 0) {
-        TIMED_PRINTLN("Failed to write to file");
-        file.close();
-        return false;
-    }
+    // Save all configuration to NVS
+    preferences.putString("ssid", ssid);
+    preferences.putString("password", password);
+    preferences.putString("shellyIP", shellyIP);
+    preferences.putString("shemeterName", ShemeterName);
+    preferences.putString("timezone", timezone);
     
-    file.close();
-    TIMED_PRINTLN("Configuration saved to LittleFS.");
+    // LED configuration
+    preferences.putInt("ledCount", LED_COUNT_var);
+    preferences.putInt("ledPin", LED_PIN_var);
+    preferences.putUInt("ledType", LED_TYPE_flags);
+    preferences.putBool("invertStrip", invertStrip);
+    
+    // Meter names
+    preferences.putString("meter0", meters[0].name);
+    preferences.putString("meter1", meters[1].name);
+    preferences.putString("meter2", meters[2].name);
+    
+    preferences.end();
+    
+    TIMED_PRINTLN("Configuration saved to NVS (persists across filesystem uploads).");
     return true;
+}
+
+// Factory reset - clears all NVS configuration
+void factoryReset() {
+    TIMED_PRINTLN("Factory reset initiated - clearing all configuration from NVS...");
+    
+    if (!preferences.begin(NVS_NAMESPACE, false)) {
+        TIMED_PRINTLN("Failed to open NVS namespace for factory reset");
+        return;
+    }
+    
+    preferences.clear(); // Clear all keys in this namespace
+    preferences.end();
+    
+    TIMED_PRINTLN("Factory reset complete. Device will restart with default configuration.");
+    delay(1000);
+    ESP.restart();
 }
 
 // Enhanced configuration handler with validation
@@ -1244,7 +1224,7 @@ void handleConfig() {
                 TIMED_PRINTLN("Failed to restart mDNS responder with new ShemeterName.");
             }
 
-            saveConfigSPIFFS();
+            saveConfig();
             TIMED_PRINTLN("Configuration updated via web interface.");
             server.sendHeader("Location", "/");
             server.send(303);
@@ -1694,15 +1674,11 @@ void setupWebServer() {
     });
     
     server.on("/factoryReset", HTTP_POST, []() {
-        // Remove config from LittleFS
-        if (LittleFS.begin()) {
-            LittleFS.remove(configPath);
-        TIMED_PRINTLN("Factory reset performed. Configuration cleared.");
-        }
+        TIMED_PRINTLN("Factory reset requested via web interface");
         server.sendHeader("Location", "/config");
-        server.send(303);
-        delay(1000);
-        ESP.restart();
+        server.send(303, "text/plain", "Factory reset initiated. Device will restart...");
+        delay(500);
+        factoryReset(); // Clears NVS and restarts
     });
     
     // Debug endpoint to check LittleFS contents
@@ -1982,7 +1958,7 @@ bool startUniqueMDNS(String& name) {
         if (MDNS.begin(uniqueName)) {
             name = uniqueName;
             TIMED_PRINTLN("mDNS responder started as " + uniqueName + ".local");
-            saveConfigSPIFFS();
+            saveConfig();
             started = true;
         } else {
             TIMED_PRINTLN("mDNS name " + uniqueName + " is already in use. Trying " + String(suffix + 1));
@@ -2050,7 +2026,7 @@ void checkAndEstablishWebSocket() {
                 TIMED_PRINTLN("Connected to " + device.type + " WebSocket after discovery.");
                 device.isActive = true;
                 if (shellyDevices.size() == 1) {
-                    saveConfigSPIFFS();
+                    saveConfig();
                 }
                 sendShellyGetStatus();
                 return;
@@ -2173,7 +2149,7 @@ void setup() {
     delay(5000);
     
     // Load configuration
-    loadConfigSPIFFS();
+    loadConfig();
     
     // Initialize LED strip with loaded configuration
     initializeLEDStrip();
