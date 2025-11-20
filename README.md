@@ -23,7 +23,12 @@ This device aims to assist homeowners in optimizing their use of renewable energ
 * Provides an interactive web interface for historical data visualization
 * Features an intuitive LED strip display for immediate energy status feedback
 
-### New in Version 2.0-RC1
+### New in Version 2.0-RC2
+* **NVS Configuration Storage**: Settings now survive filesystem (uploadfs) operations
+* **Physical Button Factory Reset**: Hold BOOT button for 5 seconds to reset device
+* **Configuration Backup/Restore**: Export and import settings via web interface
+* **Custom Partition Table**: Proper NVS allocation for reliable storage
+* **Automatic Config Migration**: Seamlessly migrates from LittleFS to NVS on first boot
 * **Interactive Chart.js Dashboard**: Real-time and historical energy visualization with zoom/pan capabilities
 * **WiFi Out-of-Box Experience**: Automatic AP mode with captive portal for easy first-time setup
 * **Enhanced WiFi Management**: AP+STA mode for network scanning while hosting configuration portal
@@ -34,9 +39,26 @@ This device aims to assist homeowners in optimizing their use of renewable energ
 * **Enhanced API Compatibility**: Supports both triphase and monophase profiles
 * **OTA Updates**: Over-the-air firmware updates for easy maintenance
 * **Improved Stability**: Comprehensive error handling and watchdog management
-* **Network Health Monitoring**: Automatic device discovery and connection recovery
+* **Chart Timestamp Validation**: Automatic cleanup of corrupted chart data
 * **Memory Optimization**: Reduced memory footprint with streaming JSON responses
-* **Configuration Validation**: Input validation and error recovery
+
+### ⚠️ Important: Upgrading to v2.0-RC2
+
+**This version requires a one-time serial flash** due to partition table changes. After this initial flash, all future updates can be done via OTA.
+
+**Upgrade Steps:**
+1. **Backup your configuration** using the web interface (Settings → Download Config Backup)
+2. Connect device via USB/Serial
+3. Flash firmware: `pio run --target upload --environment esp32c3_supermini`
+4. Flash filesystem: `pio run --target uploadfs --environment esp32c3_supermini`
+5. Device will automatically migrate existing settings to NVS on first boot
+6. If needed, restore config backup via web interface
+
+**Benefits After Upgrade:**
+- Settings persist across all future `uploadfs` operations
+- Configuration stored in NVS (separate from filesystem)
+- Web interface updates no longer require reconfiguration
+- Physical button factory reset available (hold BOOT button 5 seconds)
 
 ## Hardware Requirements
 
@@ -54,6 +76,7 @@ This device aims to assist homeowners in optimizing their use of renewable energ
 * **ESP32Ping** - Network health monitoring
 * **ArduinoOTA** - Over-the-air updates
 * **ezTime** - NTP time synchronization
+* **Preferences** - NVS storage for persistent configuration
 * **LittleFS** - Filesystem for web assets
 
 ### Web Interface Libraries (Included)
@@ -96,6 +119,13 @@ Access the configuration page at `http://[device-ip]/config` to configure:
   * GPIO pin (0-39)
   * LED type (WS2812B RGB/RGBW, SK6812, etc.)
   * **Invert Strip Direction**: Reverse LED drawing order for flexible installation
+* **Configuration Backup**:
+  * **Download Config Backup**: Export current settings as JSON file
+  * **Restore Config from Backup**: Upload previously saved configuration
+  * **⚠️ Important**: Settings stored in NVS survive `uploadfs` operations automatically
+* **System Actions**:
+  * **Test LED Strip**: Verify LED strip is working correctly
+  * **Factory Reset**: Clear all settings (also available via BOOT button - hold 5 seconds)
 
 ### Automatic Discovery
 The device automatically discovers Shelly devices on the network using mDNS. Supported devices:
@@ -276,7 +306,30 @@ This open-source project welcomes contributions to improve functionality and usa
 
 ## Version History
 
-### Version 2.0-RC1 (Current - Release Candidate)
+### Version 2.0-RC2 (Current - Release Candidate)
+**Major Changes:**
+- **NVS Configuration Storage**: Settings now persist across `uploadfs` operations
+- **Custom Partition Table**: Dedicated NVS partition for reliable storage
+- **Automatic Migration**: Seamlessly migrates from LittleFS to NVS on first boot
+
+**New Features:**
+- Physical button factory reset (hold BOOT button 5 seconds)
+- Web-based configuration backup/restore
+- Chart timestamp validation and cleanup
+- Improved error handling for config operations
+
+**Bug Fixes:**
+- Fixed settings being wiped on `uploadfs` operations
+- Fixed LED strip inversion not persisting
+- Fixed ShemeterName not being restored from storage
+- Fixed Chart.js library loading errors
+- Fixed corrupted chart timestamps causing errors
+
+**Breaking Changes:**
+- Requires one-time serial flash due to partition table changes
+- After initial flash, all future OTA updates work normally
+
+### Version 2.0-RC1
 **New Features:**
 - Interactive Chart.js dashboard with zoom/pan
 - WiFi out-of-box experience with captive portal
@@ -321,8 +374,10 @@ For issues, questions, or contributions:
 
 ---
 
-**Note**: Version 2.0-RC1 is a release candidate featuring significant improvements to WiFi management, web interface, and LED control. This build includes comprehensive error handling, enhanced user experience, and stability improvements. The periodic crash issues from earlier versions have been resolved through proper memory management, timeout handling, and network resilience features.
+**Note**: Version 2.0-RC2 is a release candidate featuring **NVS-based configuration storage** that survives filesystem updates, physical button factory reset, and comprehensive Chart.js integration. This build includes uploadfs-persistent settings, automatic config migration, and enhanced stability improvements. Settings are now stored in NVS (Non-Volatile Storage) separate from the filesystem, ensuring your configuration persists across web interface updates.
 
-**Getting Started**: Flash the firmware, connect to "SheMonitorAP", configure your WiFi, and access the interactive dashboard at `http://shemonitor.local`
+**⚠️ Important**: This version requires a **one-time serial flash** due to partition table changes. After this initial flash, all future updates can be done via OTA and your settings will automatically persist.
+
+**Getting Started**: Flash the firmware via serial, optionally backup your config, connect to "SheMonitorAP", configure your WiFi, and access the interactive dashboard at `http://shemonitor.local`
 
 **Feedback Welcome**: Please report any issues or suggestions on the GitHub repository.
