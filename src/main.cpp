@@ -17,6 +17,10 @@
 
 using namespace websockets;
 
+// NVS Preferences for uploadfs-survivable settings
+Preferences preferences;
+const char* NVS_NAMESPACE = "shemonitor";
+
 // Timing and debug utilities
 String timestamp() {
     unsigned long ms = millis();
@@ -39,6 +43,13 @@ String timestamp() {
 // Configuration constants
 #define MAX_BRIGHTNESS 255
 int globalBrightness = 32;
+
+// Physical button for factory reset (Boot button on ESP32-C3)
+#define BUTTON_PIN 9
+#define FACTORY_RESET_HOLD_TIME 5000  // 5 seconds
+unsigned long buttonPressStart = 0;
+bool buttonWasPressed = false;
+bool factoryResetTriggered = false;
 
 #ifndef USE_WS2812B_FOR_STATUS
 #define LED_STATUS_PIN 8
@@ -129,10 +140,6 @@ WebServer server(80);
 DNSServer dnsServer;
 WebsocketsClient wsClient;
 bool isAPMode = false;  // Track if we're in AP mode for captive portal
-
-// Preferences for NVS storage (persists across filesystem uploads)
-Preferences preferences;
-const char* NVS_NAMESPACE = "shemonitor";
 
 // RPC request management with timeout support
 struct PendingRequest { 
@@ -236,9 +243,8 @@ int scaledBrightness();
 void displayMetricsOnStrip();
 void handleRoot();
 void handleJson();
-bool loadConfig();
+void loadDefaultConfig();
 bool saveConfig();
-void factoryReset();
 void handleConfig();
 void setupWebServer();
 void checkWiFiConnection();
@@ -990,131 +996,119 @@ void handleJson() {
     server.send(200, "application/json", response);
 }
 
-// Configuration management using NVS (Non-Volatile Storage)
-// NVS persists across filesystem uploads, unlike LittleFS
-bool loadConfig() {
-    // Mount LittleFS for web assets
-    if (!LittleFS.begin(true)) {
-        TIMED_PRINTLN("LittleFS mount failed");
-        return false;
-    }
-    TIMED_PRINTLN("LittleFS mounted successfully");
-    
-    // Open NVS namespace
-    if (!preferences.begin(NVS_NAMESPACE, true)) { // true = read-only for loading
-        TIMED_PRINTLN("Failed to open NVS namespace");
+// Load critical settings from NVS (survives uploadfs)
+bool loadConfigNVS() {
+    if (!preferences.begin(NVS_NAMESPACE, true)) { // true = read-only
+        TIMED_PRINTLN("Failed to open NVS namespace for reading");
         return false;
     }
     
-    // Check if config exists (isKey checks for existence)
-    bool configExists = preferences.isKey("ssid");
+    bool hasConfig = preferences.isKey("ssid");
     
-    if (!configExists) {
+    if (hasConfig) {
+        TIMED_PRINTLN("Loading configuration from NVS (uploadfs-safe storage)");
+        
+        // Load WiFi credentials
+        preferences.getString("ssid", ssid, sizeof(ssid));
+        preferences.getString("password", password, sizeof(password));
+        preferences.getString("shellyIP", shellyIP, sizeof(shellyIP));
+        preferences.getString("timezone", timezone, sizeof(timezone));
+        ShemeterName = preferences.getString("shemeterName", ShemeterName);
+        fallbackSSID = ShemeterName + "AP";
+        
+        // Load LED configuration
+        LED_COUNT_var = preferences.getInt("ledCount", 60);
+        LED_PIN_var = preferences.getInt("ledPin", 4);
+        LED_TYPE_flags = preferences.getUInt("ledType", NEO_GRBW + NEO_KHZ800);
+        invertStrip = preferences.getBool("invertStrip", false);
+        
+        // Load meter names
+        meters[0].name = preferences.getString("meter0", "Grid");
+        meters[1].name = preferences.getString("meter1", "Solar");
+        meters[2].name = preferences.getString("meter2", "Consumer");
+        
         preferences.end();
-        TIMED_PRINTLN("Config not found in NVS. Initializing default configuration.");
-        strncpy(ssid, defaultSSID, sizeof(ssid) - 1);
-        ssid[sizeof(ssid) - 1] = '\0';
-        strncpy(password, defaultPassword, sizeof(password) - 1);
-        password[sizeof(password) - 1] = '\0';
-        strncpy(shellyIP, defaultShellyIP, sizeof(shellyIP) - 1);
-        shellyIP[sizeof(shellyIP) - 1] = '\0';
-        strncpy(timezone, defaultTimezone, sizeof(timezone) - 1);
-        timezone[sizeof(timezone) - 1] = '\0';
-        meters[0].name = "Grid";
-        meters[1].name = "Solar";
-        meters[2].name = "Consumer";
-        ShemeterName = "SheMonitor";
-        LED_COUNT_var = 60;
-        LED_PIN_var = 4;
-        LED_TYPE_flags = NEO_GRBW + NEO_KHZ800;
-        invertStrip = false;
-        saveConfig();
+        
+        currentLEDTypeIndex = findLEDTypeIndex(LED_TYPE_flags);
+        validateConfig();
+        
+        TIMED_PRINTLN("Configuration loaded from NVS:");
+        TIMED_PRINTLN("SSID: " + String(ssid));
+        TIMED_PRINTLN("Shelly IP: " + String(shellyIP));
+        TIMED_PRINTLN("SheMeter Name: " + ShemeterName);
+        TIMED_PRINTLN("Timezone: " + getTimezoneDisplayName(timezone) + " (" + String(timezone) + ")");
+        TIMED_PRINTLN("LED Count: " + String(LED_COUNT_var));
+        TIMED_PRINTLN("LED Pin: " + String(LED_PIN_var));
+        TIMED_PRINTLN("LED Type: " + getLEDTypeName(LED_TYPE_flags) + " (0x" + String(LED_TYPE_flags, HEX) + ")");
+        TIMED_PRINTLN("LED Strip Inverted: " + String(invertStrip ? "Yes" : "No"));
+        
         return true;
+    } else {
+        TIMED_PRINTLN("No configuration found in NVS");
+        preferences.end();
+        return false;
     }
-    
-    // Load configuration from NVS
-    preferences.getString("ssid", ssid, sizeof(ssid));
-    preferences.getString("password", password, sizeof(password));
-    preferences.getString("shellyIP", shellyIP, sizeof(shellyIP));
-    ShemeterName = preferences.getString("shemeterName", "SheMonitor");
-    preferences.getString("timezone", timezone, sizeof(timezone));
-    
-    // LED configuration
-    LED_COUNT_var = preferences.getInt("ledCount", 60);
-    LED_PIN_var = preferences.getInt("ledPin", 4);
-    LED_TYPE_flags = preferences.getUInt("ledType", NEO_GRBW + NEO_KHZ800);
-    currentLEDTypeIndex = findLEDTypeIndex(LED_TYPE_flags);
-    invertStrip = preferences.getBool("invertStrip", false);
-    
-    // Meter names
-    meters[0].name = preferences.getString("meter0", "Grid");
-    meters[1].name = preferences.getString("meter1", "Solar");
-    meters[2].name = preferences.getString("meter2", "Consumer");
-    
-    preferences.end();
-
-    // Validate configuration
-    validateConfig();
-
-    TIMED_PRINTLN("Configuration loaded from NVS:");
-    TIMED_PRINTLN("SSID: " + String(ssid));
-    TIMED_PRINTLN("Shelly IP: " + String(shellyIP));
-    TIMED_PRINTLN("SheMeter Name: " + ShemeterName);
-    TIMED_PRINTLN("Timezone: " + getTimezoneDisplayName(timezone) + " (" + String(timezone) + ")");
-    TIMED_PRINTLN("LED Count: " + String(LED_COUNT_var));
-    TIMED_PRINTLN("LED Pin: " + String(LED_PIN_var));
-    TIMED_PRINTLN("LED Type: " + getLEDTypeName(LED_TYPE_flags) + " (0x" + String(LED_TYPE_flags, HEX) + ")");
-    TIMED_PRINTLN("LED Strip Inverted: " + String(invertStrip ? "Yes" : "No"));
-    
-    return true;
 }
 
-bool saveConfig() {
-    // Open NVS namespace for writing
-    if (!preferences.begin(NVS_NAMESPACE, false)) { // false = read-write mode
+// Save critical settings to NVS (survives uploadfs)
+bool saveConfigNVS() {
+    if (!preferences.begin(NVS_NAMESPACE, false)) { // false = read-write
         TIMED_PRINTLN("Failed to open NVS namespace for writing");
         return false;
     }
     
-    // Save all configuration to NVS
+    // Save WiFi credentials
     preferences.putString("ssid", ssid);
     preferences.putString("password", password);
     preferences.putString("shellyIP", shellyIP);
-    preferences.putString("shemeterName", ShemeterName);
     preferences.putString("timezone", timezone);
+    preferences.putString("shemeterName", ShemeterName.c_str());
     
-    // LED configuration
+    // Save LED configuration
     preferences.putInt("ledCount", LED_COUNT_var);
     preferences.putInt("ledPin", LED_PIN_var);
     preferences.putUInt("ledType", LED_TYPE_flags);
     preferences.putBool("invertStrip", invertStrip);
     
-    // Meter names
-    preferences.putString("meter0", meters[0].name);
-    preferences.putString("meter1", meters[1].name);
-    preferences.putString("meter2", meters[2].name);
+    // Save meter names
+    preferences.putString("meter0", meters[0].name.c_str());
+    preferences.putString("meter1", meters[1].name.c_str());
+    preferences.putString("meter2", meters[2].name.c_str());
     
     preferences.end();
     
-    TIMED_PRINTLN("Configuration saved to NVS (persists across filesystem uploads).");
+    TIMED_PRINTLN("Configuration saved to NVS (uploadfs-safe storage)");
     return true;
 }
 
-// Factory reset - clears all NVS configuration
-void factoryReset() {
-    TIMED_PRINTLN("Factory reset initiated - clearing all configuration from NVS...");
-    
-    if (!preferences.begin(NVS_NAMESPACE, false)) {
-        TIMED_PRINTLN("Failed to open NVS namespace for factory reset");
-        return;
-    }
-    
-    preferences.clear(); // Clear all keys in this namespace
-    preferences.end();
-    
-    TIMED_PRINTLN("Factory reset complete. Device will restart with default configuration.");
-    delay(1000);
-    ESP.restart();
+void loadDefaultConfig() {
+    strncpy(ssid, defaultSSID, sizeof(ssid) - 1);
+    ssid[sizeof(ssid) - 1] = '\0';
+    strncpy(password, defaultPassword, sizeof(password) - 1);
+    password[sizeof(password) - 1] = '\0';
+    strncpy(shellyIP, defaultShellyIP, sizeof(shellyIP) - 1);
+    shellyIP[sizeof(shellyIP) - 1] = '\0';
+    strncpy(timezone, defaultTimezone, sizeof(timezone) - 1);
+    timezone[sizeof(timezone) - 1] = '\0';
+
+    ShemeterName = "SheMonitor";
+    fallbackSSID = ShemeterName + "AP";
+
+    meters[0].name = "Grid";
+    meters[1].name = "Solar";
+    meters[2].name = "Consumer";
+
+    LED_COUNT_var = 60;
+    LED_PIN_var = 4;
+    LED_TYPE_flags = NEO_GRBW + NEO_KHZ800;
+    currentLEDTypeIndex = findLEDTypeIndex(LED_TYPE_flags);
+    invertStrip = false;
+
+    validateConfig();
+}
+
+bool saveConfig() {
+    return saveConfigNVS();
 }
 
 // Enhanced configuration handler with validation
@@ -1224,7 +1218,7 @@ void handleConfig() {
                 TIMED_PRINTLN("Failed to restart mDNS responder with new ShemeterName.");
             }
 
-            saveConfig();
+        saveConfig();
             TIMED_PRINTLN("Configuration updated via web interface.");
             server.sendHeader("Location", "/");
             server.send(303);
@@ -1363,6 +1357,18 @@ void handleConfig() {
         html += "</form>";
         html += "</div>";
         
+        // Configuration Backup/Restore
+        html += "<div class='card'>";
+        html += "<div class='section-title'>Configuration Backup</div>";
+        html += "<div style='margin-bottom: 15px; padding: 10px; background: #fff3cd; border-left: 4px solid #ffc107; font-size: 0.9em;'>";
+        html += "<strong>⚠️ Tip:</strong> Settings now live in NVS (survives uploadfs). Still create a backup before factory reset or migrating to another device.";
+        html += "</div>";
+        html += "<button type='button' class='btn btn-secondary' onclick='downloadConfig()' style='margin-right: 10px;'>Download Config Backup</button>";
+        html += "<button type='button' class='btn btn-secondary' onclick='document.getElementById(\"configFile\").click()'>Restore Config from Backup</button>";
+        html += "<input type='file' id='configFile' accept='.json' style='display:none' onchange='uploadConfig(this.files[0])'>";
+        html += "<div id='configStatus' style='margin-top: 10px; font-size: 0.9em;'></div>";
+        html += "</div>";
+        
         // System Actions
         html += "<div class='card'>";
         html += "<div class='section-title'>System Actions</div>";
@@ -1374,6 +1380,9 @@ void handleConfig() {
         html += "<form action='/factoryReset' method='post' style='display: inline-block;' onsubmit='return confirm(\"Are you sure you want to reset all settings?\");'>";
         html += "<button type='submit' class='btn btn-danger'>Factory Reset</button>";
         html += "</form>";
+        html += "<div style='margin-top: 15px; padding: 10px; background: #f8f9fa; border-left: 4px solid #0066cc; font-size: 0.9em;'>";
+        html += "<strong>💡 Tip:</strong> You can also factory reset by holding the BOOT button (GPIO9) for 5 seconds. The LED will blink red during the hold.";
+        html += "</div>";
         html += "</div>";
 
         html += "</div>";
@@ -1415,6 +1424,40 @@ void handleConfig() {
         html += "    console.error('Debug data fetch error:', error);";
         html += "    alert('Debug data fetch failed. Check console for details.');";
         html += "  });";
+        html += "}";
+        html += "function downloadConfig() {";
+        html += "  const link = document.createElement('a');";
+        html += "  link.href = '/config/download';";
+        html += "  link.download = 'config_backup.json';";
+        html += "  document.body.appendChild(link);";
+        html += "  link.click();";
+        html += "  document.body.removeChild(link);";
+        html += "  document.getElementById('configStatus').innerHTML = '<span style=\"color:#28a745\">✓ Config downloaded successfully</span>';";
+        html += "  setTimeout(() => document.getElementById('configStatus').innerHTML = '', 3000);";
+        html += "}";
+        html += "function uploadConfig(file) {";
+        html += "  if (!file) return;";
+        html += "  const reader = new FileReader();";
+        html += "  reader.onload = function(e) {";
+        html += "    fetch('/config/upload', {";
+        html += "      method: 'POST',";
+        html += "      headers: {'Content-Type': 'application/json'},";
+        html += "      body: e.target.result";
+        html += "    })";
+        html += "    .then(response => response.json())";
+        html += "    .then(data => {";
+        html += "      if (data.success) {";
+        html += "        document.getElementById('configStatus').innerHTML = '<span style=\"color:#28a745\">✓ ' + data.message + '</span>';";
+        html += "        setTimeout(() => location.reload(), 2000);";
+        html += "      } else {";
+        html += "        document.getElementById('configStatus').innerHTML = '<span style=\"color:#dc3545\">✗ ' + data.message + '</span>';";
+        html += "      }";
+        html += "    })";
+        html += "    .catch(error => {";
+        html += "      document.getElementById('configStatus').innerHTML = '<span style=\"color:#dc3545\">✗ Upload failed: ' + error + '</span>';";
+        html += "    });";
+        html += "  };";
+        html += "  reader.readAsText(file);";
         html += "}";
         html += "</script>";
 
@@ -1674,11 +1717,119 @@ void setupWebServer() {
     });
     
     server.on("/factoryReset", HTTP_POST, []() {
-        TIMED_PRINTLN("Factory reset requested via web interface");
+        TIMED_PRINTLN("Factory reset requested");
+        
+        // Clear NVS (primary storage)
+        if (preferences.begin(NVS_NAMESPACE, false)) {
+            preferences.clear();
+            preferences.end();
+            TIMED_PRINTLN("NVS cleared");
+        }
+        
+        TIMED_PRINTLN("Factory reset performed. All configuration cleared.");
         server.sendHeader("Location", "/config");
-        server.send(303, "text/plain", "Factory reset initiated. Device will restart...");
-        delay(500);
-        factoryReset(); // Clears NVS and restarts
+        server.send(303);
+        delay(1000);
+        ESP.restart();
+    });
+    
+    // Config backup endpoint - download current configuration snapshot
+    server.on("/config/download", HTTP_GET, []() {
+        JsonDocument doc;
+        doc["ssid"] = ssid;
+        doc["password"] = password;
+        doc["shellyIP"] = shellyIP;
+        doc["shemeterName"] = ShemeterName;
+        doc["timezone"] = timezone;
+        doc["ledCount"] = LED_COUNT_var;
+        doc["ledPin"] = LED_PIN_var;
+        doc["ledType"] = LED_TYPE_flags;
+        doc["invertStrip"] = invertStrip;
+
+        JsonArray meterArray = doc["meters"].to<JsonArray>();
+        for (int i = 0; i < 3; i++) {
+            meterArray.add(meters[i].name);
+        }
+
+        String serialized;
+        serializeJson(doc, serialized);
+
+        server.sendHeader("Content-Disposition", "attachment; filename=config.json");
+        server.send(200, "application/json", serialized);
+        TIMED_PRINTLN("Config downloaded from NVS snapshot");
+    });
+    
+    // Config restore endpoint - upload config.json
+    server.on("/config/upload", HTTP_POST, []() {
+        if (!server.hasArg("plain")) {
+            server.send(400, "application/json", "{\"success\":false,\"message\":\"No data received\"}");
+            return;
+        }
+
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, server.arg("plain"));
+
+        if (error) {
+            server.send(400, "application/json", "{\"success\":false,\"message\":\"Invalid JSON\"}");
+            return;
+        }
+
+        if (doc["ssid"].is<const char*>()) {
+            strncpy(ssid, doc["ssid"], sizeof(ssid) - 1);
+            ssid[sizeof(ssid) - 1] = '\0';
+        }
+        if (doc["password"].is<const char*>()) {
+            strncpy(password, doc["password"], sizeof(password) - 1);
+            password[sizeof(password) - 1] = '\0';
+        }
+        if (doc["shellyIP"].is<const char*>()) {
+            strncpy(shellyIP, doc["shellyIP"], sizeof(shellyIP) - 1);
+            shellyIP[sizeof(shellyIP) - 1] = '\0';
+        }
+        if (doc["timezone"].is<const char*>()) {
+            strncpy(timezone, doc["timezone"], sizeof(timezone) - 1);
+            timezone[sizeof(timezone) - 1] = '\0';
+        }
+        if (doc["shemeterName"].is<const char*>()) {
+            ShemeterName = String(doc["shemeterName"].as<const char*>());
+            fallbackSSID = ShemeterName + "AP";
+        }
+        if (doc["ledCount"].is<int>()) LED_COUNT_var = doc["ledCount"];
+        if (doc["ledPin"].is<int>()) LED_PIN_var = doc["ledPin"];
+        if (doc["ledType"].is<uint32_t>()) {
+            LED_TYPE_flags = doc["ledType"];
+            currentLEDTypeIndex = findLEDTypeIndex(LED_TYPE_flags);
+        }
+        if (doc["invertStrip"].is<bool>()) invertStrip = doc["invertStrip"];
+
+        if (doc["meters"].is<JsonArray>()) {
+            JsonArray meterArray = doc["meters"].as<JsonArray>();
+            int index = 0;
+            for (JsonVariant meterName : meterArray) {
+                if (index < 3 && meterName.is<const char*>()) {
+                    meters[index].name = String(meterName.as<const char*>());
+                    index++;
+                }
+            }
+            while (index < 3) {
+                if (index == 0) meters[index].name = "Grid";
+                else if (index == 1) meters[index].name = "Solar";
+                else meters[index].name = "Consumer";
+                index++;
+            }
+        }
+
+        validateConfig();
+
+        if (saveConfig()) {
+            TIMED_PRINTLN("Config restored from upload to NVS");
+            server.send(200, "application/json", "{\"success\":true,\"message\":\"Config restored. Device will reboot.\"}");
+            delay(500);
+            ESP.restart();
+            return;
+        } else {
+            server.send(500, "application/json", "{\"success\":false,\"message\":\"Failed to save config\"}");
+        }
     });
     
     // Debug endpoint to check LittleFS contents
@@ -2026,7 +2177,7 @@ void checkAndEstablishWebSocket() {
                 TIMED_PRINTLN("Connected to " + device.type + " WebSocket after discovery.");
                 device.isActive = true;
                 if (shellyDevices.size() == 1) {
-                    saveConfig();
+            saveConfig();
                 }
                 sendShellyGetStatus();
                 return;
@@ -2108,6 +2259,77 @@ void handleOTA() {
     ArduinoOTA.handle();
 }
 
+// Physical button handler for factory reset
+void checkFactoryResetButton() {
+    bool buttonPressed = (digitalRead(BUTTON_PIN) == LOW);  // Active LOW
+    
+    if (buttonPressed && !buttonWasPressed) {
+        // Button just pressed
+        buttonPressStart = millis();
+        buttonWasPressed = true;
+        factoryResetTriggered = false;
+        TIMED_PRINTLN("Factory reset button pressed. Hold for " + String(FACTORY_RESET_HOLD_TIME / 1000) + " seconds to reset...");
+    } 
+    else if (buttonPressed && buttonWasPressed && !factoryResetTriggered) {
+        // Button being held
+        unsigned long holdDuration = millis() - buttonPressStart;
+        
+        // Visual feedback: Blink LED faster as hold time increases
+        #ifdef USE_WS2812B_FOR_STATUS
+        if (holdDuration % 200 < 100) {
+            statusLED.setPixelColor(0, statusLED.Color(255, 0, 0));  // Red
+            statusLED.show();
+        } else {
+            statusLED.clear();
+            statusLED.show();
+        }
+        #endif
+        
+        if (holdDuration >= FACTORY_RESET_HOLD_TIME) {
+            // Trigger factory reset
+            factoryResetTriggered = true;
+            TIMED_PRINTLN("=== FACTORY RESET TRIGGERED ===");
+            
+            // Visual confirmation: Fast red blink
+            #ifdef USE_WS2812B_FOR_STATUS
+            for (int i = 0; i < 10; i++) {
+                statusLED.setPixelColor(0, statusLED.Color(255, 0, 0));
+                statusLED.show();
+                delay(100);
+                statusLED.clear();
+                statusLED.show();
+                delay(100);
+            }
+            #endif
+            
+            // Clear NVS (primary storage)
+            if (preferences.begin(NVS_NAMESPACE, false)) {
+                preferences.clear();
+                preferences.end();
+                TIMED_PRINTLN("NVS configuration cleared successfully.");
+            }
+            
+            TIMED_PRINTLN("Factory reset complete. Restarting device...");
+            delay(1000);
+            ESP.restart();
+        }
+    }
+    else if (!buttonPressed && buttonWasPressed) {
+        // Button released
+        unsigned long holdDuration = millis() - buttonPressStart;
+        if (!factoryResetTriggered) {
+            TIMED_PRINTLN("Button released after " + String(holdDuration) + "ms (reset requires " + String(FACTORY_RESET_HOLD_TIME) + "ms)");
+        }
+        buttonWasPressed = false;
+        
+        // Restore normal status LED
+        #ifdef USE_WS2812B_FOR_STATUS
+        statusLED.clear();
+        statusLED.show();
+        #endif
+    }
+}
+
 // Main setup function
 void setup() {
     Serial.begin(115200);
@@ -2136,6 +2358,10 @@ void setup() {
     
     TIMED_PRINTLN("Watchdog timer initialized (30s timeout)");
 
+    // Initialize physical button for factory reset
+    pinMode(BUTTON_PIN, INPUT_PULLUP);  // Boot button (GPIO9) with internal pull-up
+    TIMED_PRINTLN("Factory reset button initialized (GPIO" + String(BUTTON_PIN) + ")");
+    
     // Initialize status LED
 #ifdef USE_WS2812B_FOR_STATUS
     statusLED.begin();
@@ -2148,8 +2374,15 @@ void setup() {
 
     delay(5000);
     
-    // Load configuration
-    loadConfig();
+    // Load configuration - Try NVS first (survives uploadfs)
+    TIMED_PRINTLN("Loading configuration...");
+    bool configLoaded = loadConfigNVS();
+    
+    if (!configLoaded) {
+        TIMED_PRINTLN("No configuration found in NVS. Loading defaults and saving.");
+        loadDefaultConfig();
+        saveConfigNVS();
+    }
     
     // Initialize LED strip with loaded configuration
     initializeLEDStrip();
@@ -2282,6 +2515,9 @@ void loop() {
 
     // Handle OTA updates
     handleOTA();
+
+    // Check factory reset button
+    checkFactoryResetButton();
 
     // Data update cycle - only if WiFi is connected
     if (currentMillis - previousMillis >= dataUpdateInterval) {

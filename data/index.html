@@ -374,6 +374,38 @@
     let connectionFailures = 0;
     let lastSuccessfulFetch = Date.now();
     
+    // Timestamp validation helper
+    function isValidTimestamp(timestamp) {
+      if (!timestamp) return false;
+      const time = timestamp instanceof Date ? timestamp.getTime() : new Date(timestamp).getTime();
+      // Check if timestamp is reasonable (between year 2020 and 2030)
+      const min = new Date('2020-01-01').getTime();
+      const max = new Date('2030-12-31').getTime();
+      return !isNaN(time) && time >= min && time <= max;
+    }
+    
+    // Clean chart data to remove invalid timestamps
+    function cleanChartData() {
+      if (!energyChart || !energyChart.data) return;
+      
+      const validIndices = [];
+      energyChart.data.labels.forEach((label, idx) => {
+        if (isValidTimestamp(label)) {
+          validIndices.push(idx);
+        } else {
+          console.warn(`Removing invalid timestamp at index ${idx}:`, label);
+        }
+      });
+      
+      if (validIndices.length < energyChart.data.labels.length) {
+        energyChart.data.labels = validIndices.map(i => energyChart.data.labels[i]);
+        energyChart.data.datasets.forEach(dataset => {
+          dataset.data = validIndices.map(i => dataset.data[i]);
+        });
+        console.log(`Cleaned chart: removed ${energyChart.data.labels.length - validIndices.length} invalid points`);
+      }
+    }
+    
     function updateConnectionStatus(status, message) {
       const statusEl = document.getElementById('connectionStatus');
       if (status === 'connected') {
@@ -628,6 +660,13 @@
           console.log("Loading history points in chronological order:");
           downsampledData.forEach((point, index) => {
             let timeLabel = moment(point.timestamp, "YYYYMMDDTHHmmssSSS").toDate();
+            
+            // Validate timestamp before adding
+            if (!isValidTimestamp(timeLabel)) {
+              console.warn(`Skipping history point ${index} with invalid timestamp:`, point.timestamp, timeLabel);
+              return;
+            }
+            
             if (index < 3 || index >= downsampledData.length - 3) { // Only log first and last few points
               console.log(`History ${index}: ${timeLabel.toISOString()} - Grid:${point.Grid}, Solar:${point.Solar}, Consumer:${point.Consumer}`);
             }
@@ -644,6 +683,9 @@
             console.log("Last history timestamp:", window.lastHistoryTimestamp.toISOString());
           }
 
+          // Clean any invalid data before updating
+          cleanChartData();
+          
           energyChart.update('none'); // Use 'none' animation for better performance
           console.log("Full history loaded, sorted, and chart updated.");
         })
@@ -816,6 +858,13 @@
 
            // Use consistent timestamp for chart data
            let timeLabel = new Date();
+           
+           // Validate timestamp before adding
+           if (!isValidTimestamp(timeLabel)) {
+               console.error(`Invalid timestamp detected: ${timeLabel}`);
+               return;
+           }
+           
            let lastTime = energyChart.data.labels.length > 0 ? 
                          energyChart.data.labels[energyChart.data.labels.length - 1] : null;
            
@@ -843,6 +892,9 @@
              energyChart.data.datasets.forEach(dataset => dataset.data.shift());
            }
 
+           // Clean any invalid data before updating
+           cleanChartData();
+           
            energyChart.update();
            console.log(`Chart updated. Total points: ${energyChart.data.labels.length}`);
         })
