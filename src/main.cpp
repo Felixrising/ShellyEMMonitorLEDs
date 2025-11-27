@@ -7,13 +7,20 @@
 #include <LittleFS.h>
 #include <ArduinoWebsockets.h>
 #include <esp_task_wdt.h>
+#include <esp_heap_caps.h>
 #include <ESP32Ping.h>
 #include <ArduinoOTA.h>
 #include <ezTime.h>
 #include <Preferences.h>
+#include <algorithm>
+#include <limits>
 #include <map>
 #include <vector>
 #include "includes.h"
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
 
 using namespace websockets;
 
@@ -134,6 +141,35 @@ struct DataPoint {
 const int HISTORY_SIZE = 72; // 1.2 hours at 1-minute intervals (further reduced for ESP32-C3 memory constraints)
 DataPoint history[HISTORY_SIZE];
 int historyIndex = 0;
+
+// JsonDocument sizing to avoid heap fragmentation
+constexpr size_t JSON_CAPACITY_SMALL = 256;
+constexpr size_t JSON_CAPACITY_MEDIUM = 1024;
+constexpr size_t JSON_CAPACITY_CONFIG = 4096;
+constexpr size_t JSON_CAPACITY_LARGE = 6144;
+constexpr size_t JSON_CAPACITY_WIFI_SCAN = 4096;
+
+// Persistent crash diagnostics
+RTC_DATA_ATTR uint32_t bootCounter = 0;
+RTC_DATA_ATTR uint32_t crashCounter = 0;
+RTC_DATA_ATTR uint32_t lastResetReasonRaw = ESP_RST_POWERON;
+
+// Log/metrics configuration
+const char* LOG_DIRECTORY = "/logs";
+const size_t MAX_LOG_FILES = 72; // approx 72 hours assuming 1 file per hour
+const size_t LOG_FILE_SIZE_LIMIT = 50 * 1024; // 50 KB per log file
+const unsigned long METRICS_LOG_INTERVAL = 60000;
+const unsigned long LOW_MEMORY_LOG_INTERVAL = 300000;
+const size_t LOW_MEMORY_THRESHOLD = 45000;
+
+// Metrics tracking
+bool littleFSReady = false;
+unsigned long lastMetricsLog = 0;
+unsigned long lastLowMemoryLog = 0;
+size_t lowestHeapObserved = std::numeric_limits<size_t>::max();
+size_t lowestLargestBlockObserved = std::numeric_limits<size_t>::max();
+unsigned long maxLoopDurationMicros = 0;
+unsigned long lastLoopDurationMicros = 0;
 
 // Network components
 WebServer server(80);
@@ -274,6 +310,17 @@ void discoverShellyDevices();
 void connectToMultipleDevices();
 void setupOTA();
 void handleOTA();
+bool ensureLittleFS();
+bool ensureLogDirectory();
+void cleanupOldLogs();
+void trimLogFile(const String& path);
+String getLogFilePath();
+void logSystemEvent(const char* level, const String& message);
+void logSystemMetrics(bool force = false);
+void monitorMemoryHealth();
+String resetReasonToString(esp_reset_reason_t reason);
+void recordResetDiagnostics();
+void updateDeviceStartTimeFromClock();
 
 // Helper function to find LED type index by flags
 int findLEDTypeIndex(uint32_t flags) {
@@ -339,6 +386,225 @@ String formatUptime(unsigned long uptimeSeconds) {
     return result;
 }
 
+bool ensureLittleFS() {
+    if (littleFSReady) {
+        return true;
+    }
+    if (LittleFS.begin(false)) {
+        littleFSReady = true;
+        TIMED_PRINTLN("LittleFS mounted successfully.");
+        return true;
+    }
+    TIMED_PRINTLN("LittleFS mount failed (non-destructive). Logging/static assets unavailable.");
+    return false;
+}
+
+bool ensureLogDirectory() {
+    if (!ensureLittleFS()) {
+        return false;
+    }
+    if (!LittleFS.exists(LOG_DIRECTORY)) {
+        if (!LittleFS.mkdir(LOG_DIRECTORY)) {
+            TIMED_PRINTLN("Failed to create log directory.");
+            return false;
+        }
+    }
+    return true;
+}
+
+void trimLogFile(const String& path) {
+    if (!LittleFS.exists(path.c_str())) {
+        return;
+    }
+    File file = LittleFS.open(path, "r");
+    if (!file) {
+        return;
+    }
+    size_t fileSize = file.size();
+    if (fileSize <= LOG_FILE_SIZE_LIMIT) {
+        file.close();
+        return;
+    }
+    size_t retainBytes = LOG_FILE_SIZE_LIMIT / 2;
+    size_t seekPos = fileSize > retainBytes ? fileSize - retainBytes : 0;
+    file.seek(seekPos, SeekSet);
+    String tempPath = String(LOG_DIRECTORY) + "/.tmp";
+    File temp = LittleFS.open(tempPath, "w");
+    if (!temp) {
+        file.close();
+        return;
+    }
+    temp.println("[Log truncated - keeping recent entries]");
+    while (file.available()) {
+        temp.write(file.read());
+    }
+    file.close();
+    temp.close();
+    LittleFS.remove(path.c_str());
+    LittleFS.rename(tempPath.c_str(), path.c_str());
+}
+
+void cleanupOldLogs() {
+    if (!ensureLogDirectory()) {
+        return;
+    }
+    File dir = LittleFS.open(LOG_DIRECTORY);
+    if (!dir || !dir.isDirectory()) {
+        return;
+    }
+    std::vector<String> files;
+    while (true) {
+        File entry = dir.openNextFile();
+        if (!entry) {
+            break;
+        }
+        files.push_back(String(entry.name()));
+        entry.close();
+    }
+    dir.close();
+    if (files.size() <= MAX_LOG_FILES) {
+        return;
+    }
+    std::sort(files.begin(), files.end());
+    while (files.size() > MAX_LOG_FILES) {
+        String oldest = files.front();
+        files.erase(files.begin());
+        if (!oldest.startsWith("/")) {
+            oldest = String(LOG_DIRECTORY) + "/" + oldest;
+        }
+        LittleFS.remove(oldest.c_str());
+    }
+}
+
+String getLogFilePath() {
+    char buffer[32];
+    if (timeInitialized) {
+        time_t now = myTZ.now();
+        struct tm timeinfo;
+        localtime_r(&now, &timeinfo);
+        strftime(buffer, sizeof(buffer), "/logs/%Y%m%d_%H.log", &timeinfo);
+    } else {
+        unsigned long hoursSinceBoot = millis() / 3600000UL;
+        snprintf(buffer, sizeof(buffer), "/logs/boot%05lu_%02lu.log",
+                 static_cast<unsigned long>(bootCounter),
+                 static_cast<unsigned long>(hoursSinceBoot % 100));
+    }
+    return String(buffer);
+}
+
+void logSystemEvent(const char* level, const String& message) {
+    if (!ensureLogDirectory()) {
+        return;
+    }
+    cleanupOldLogs();
+    String logPath = getLogFilePath();
+    const char* mode = LittleFS.exists(logPath.c_str()) ? "a" : "w";
+    File logFile = LittleFS.open(logPath, mode);
+    if (!logFile) {
+        return;
+    }
+    String timeLabel;
+    if (timeInitialized) {
+        timeLabel = myTZ.dateTime("Y-m-d H:i:s T");
+    } else {
+        timeLabel = "uptime:" + String(millis() / 1000) + "s";
+    }
+    logFile.print(timeLabel);
+    logFile.print(" [");
+    logFile.print(level);
+    logFile.print("] ");
+    logFile.println(message);
+    logFile.close();
+    trimLogFile(logPath);
+}
+
+String resetReasonToString(esp_reset_reason_t reason) {
+    switch (reason) {
+        case ESP_RST_UNKNOWN: return "UNKNOWN";
+        case ESP_RST_POWERON: return "POWERON";
+        case ESP_RST_EXT: return "EXTERNAL";
+        case ESP_RST_SW: return "SOFTWARE";
+        case ESP_RST_PANIC: return "PANIC";
+        case ESP_RST_INT_WDT: return "INT_WDT";
+        case ESP_RST_TASK_WDT: return "TASK_WDT";
+        case ESP_RST_WDT: return "WDT";
+        case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+        case ESP_RST_BROWNOUT: return "BROWNOUT";
+        case ESP_RST_SDIO: return "SDIO";
+        default: return "UNSPECIFIED";
+    }
+}
+
+void recordResetDiagnostics() {
+    esp_reset_reason_t reason = esp_reset_reason();
+    lastResetReasonRaw = reason;
+    String message = "Boot #" + String(bootCounter) + " reset=" + resetReasonToString(reason) +
+                     " freeHeap=" + String(ESP.getFreeHeap()) +
+                     " flashFree=" + String(ESP.getFreeSketchSpace());
+    logSystemEvent("BOOT", message);
+    switch (reason) {
+        case ESP_RST_PANIC:
+        case ESP_RST_INT_WDT:
+        case ESP_RST_TASK_WDT:
+        case ESP_RST_WDT:
+        case ESP_RST_BROWNOUT:
+            crashCounter++;
+            logSystemEvent("CRASH", "Crash count=" + String(crashCounter) + " reason=" + resetReasonToString(reason));
+            break;
+        default:
+            break;
+    }
+}
+
+void updateDeviceStartTimeFromClock() {
+    if (!timeInitialized) {
+        return;
+    }
+    time_t now = myTZ.now();
+    if (now > 0) {
+        deviceStartTimeMillis = static_cast<uint64_t>(now) * 1000ULL - millis();
+    }
+}
+
+void monitorMemoryHealth() {
+    size_t freeHeap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    size_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    if (freeHeap < lowestHeapObserved) {
+        lowestHeapObserved = freeHeap;
+    }
+    if (largestBlock < lowestLargestBlockObserved) {
+        lowestLargestBlockObserved = largestBlock;
+    }
+    if (freeHeap < LOW_MEMORY_THRESHOLD && millis() - lastLowMemoryLog > LOW_MEMORY_LOG_INTERVAL) {
+        lastLowMemoryLog = millis();
+        char buffer[128];
+        snprintf(buffer, sizeof(buffer), "Low heap: %uB free, largest block %uB", static_cast<unsigned int>(freeHeap),
+                 static_cast<unsigned int>(largestBlock));
+        logSystemEvent("WARN", String(buffer));
+    }
+}
+
+void logSystemMetrics(bool force) {
+    unsigned long now = millis();
+    if (!force && now - lastMetricsLog < METRICS_LOG_INTERVAL) {
+        return;
+    }
+    lastMetricsLog = now;
+    size_t freeHeap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    size_t minHeap = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+    size_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    char buffer[192];
+    snprintf(buffer, sizeof(buffer),
+             "heap=%uB (min=%uB largest=%uB) loopMax=%luus WiFi=%d ws=%d pendingRPC=%u",
+             static_cast<unsigned int>(freeHeap),
+             static_cast<unsigned int>(minHeap),
+             static_cast<unsigned int>(largestBlock),
+             maxLoopDurationMicros,
+             static_cast<int>(WiFi.status()),
+             static_cast<int>(wsClient.available()),
+             static_cast<unsigned int>(pendingRequests.size()));
+    logSystemEvent("METRICS", String(buffer));
+}
 // Validation functions
 bool validateConfig() {
     bool valid = true;
@@ -394,18 +660,28 @@ void cleanupPendingRequests() {
 
 void cleanupExpiredRequests() {
     unsigned long now = millis();
+    bool timedOut = false;
     for (auto it = pendingRequests.begin(); it != pendingRequests.end();) {
-        if (now - it->second.timestamp > REQUEST_TIMEOUT) {
-            TIMED_PRINTLN("Request " + String(it->first) + " timed out");
+        unsigned long age = now - it->second.timestamp;
+        if (age > REQUEST_TIMEOUT) {
+            TIMED_PRINTLN("Request " + String(it->first) + " timed out after " + String(age) + "ms");
+            logSystemEvent("RPC", "Request " + String(it->first) + " timed out after " + String(age) + "ms");
             it = pendingRequests.erase(it);
+            timedOut = true;
         } else {
             ++it;
         }
+    }
+    if (timedOut && pendingRequests.empty()) {
+        rpcInProgress = false;
+        TIMED_PRINTLN("RPC state reset after timeout recovery");
+        logSystemEvent("RPC", "RPC state reset after timeout recovery");
     }
 }
 
 void handleWebSocketError(const String& error) {
     TIMED_PRINTLN("WebSocket error: " + error);
+    logSystemEvent("WS", "WebSocket error: " + error);
     cleanupPendingRequests();
     lastWebSocketAttempt = millis() + webSocketRetryInterval; // Backoff
 }
@@ -413,6 +689,7 @@ void handleWebSocketError(const String& error) {
 void checkWebSocketHealth() {
     if (wsClient.available() && (millis() - lastWSActivity > WS_TIMEOUT)) {
         TIMED_PRINTLN("WebSocket timeout, reconnecting...");
+        logSystemEvent("WS", "WebSocket timeout detected, closing connection");
         wsClient.close();
         cleanupPendingRequests();
     }
@@ -432,6 +709,7 @@ void monitorNetworkHealth() {
             ip.fromString(shellyIP);
             if (!Ping.ping(ip, 1)) { // Single ping with timeout
                 TIMED_PRINTLN("Shelly device unreachable, triggering rediscovery");
+                logSystemEvent("WARN", "Shelly device unreachable at " + String(shellyIP));
                 wsClient.close();
                 strcpy(shellyIP, ""); // Force rediscovery
             }
@@ -607,9 +885,11 @@ bool tryConnectWiFi(const char* ssid, const char* password) {
     if (WiFi.status() == WL_CONNECTED) {
         TIMED_PRINTLN("WiFi Connected!");
         TIMED_PRINTLN("IP Address: " + String(WiFi.localIP()));
+        logSystemEvent("WIFI", "Connected to SSID=" + String(ssid) + " IP=" + WiFi.localIP().toString());
         return true;
     } else {
         TIMED_PRINTLN("Failed to connect to WiFi.");
+        logSystemEvent("WIFI", "Failed to connect to SSID=" + String(ssid));
         return false;
     }
 }
@@ -654,6 +934,7 @@ void checkWiFiConnection() {
                             TIMED_PRINTLN("Timezone set to: " + getTimezoneDisplayName(timezone));
                             TIMED_PRINTLN("Current time: " + myTZ.dateTime("Y-m-d H:i:s T"));
                             timeInitialized = true;
+                            updateDeviceStartTimeFromClock();
                         }
                     }
                     
@@ -710,6 +991,7 @@ void startAPMode() {
     TIMED_PRINTLN("DEBUG: startAPMode() executing past throttle check...");
     
     TIMED_PRINTLN("Starting Access Point mode for WiFi configuration...");
+    logSystemEvent("WIFI", "Entering AP mode for configuration");
     
     // Stop web server if it's running
     server.stop();
@@ -760,8 +1042,10 @@ void startAPMode() {
         // Additional diagnostics
         TIMED_PRINTLN("AP Stations: " + String(WiFi.softAPgetStationNum()));
         TIMED_PRINTLN("AP Channel: " + String(WiFi.channel()));
+        logSystemEvent("WIFI", "AP mode active SSID=" + fallbackSSID + " IP=" + WiFi.softAPIP().toString());
     } else {
         TIMED_PRINTLN("Failed to start Access Point!");
+        logSystemEvent("ERROR", "Failed to start AP mode. Restarting device.");
         delay(2000);
         ESP.restart(); // Restart if AP fails to start
     }
@@ -822,7 +1106,8 @@ void handleWiFiConfig() {
 void handleWiFiScan() {
     TIMED_PRINTLN("=== WiFi Scan Request Received ===");
     
-    JsonDocument doc;
+    static StaticJsonDocument<JSON_CAPACITY_WIFI_SCAN> doc;
+    doc.clear();
     JsonArray networks = doc["networks"].to<JsonArray>();
     
     // Ensure we're in a mode that supports scanning
@@ -887,7 +1172,7 @@ void handleWiFiSave() {
         return;
     }
     
-    JsonDocument doc;
+    StaticJsonDocument<JSON_CAPACITY_SMALL> doc;
     DeserializationError error = deserializeJson(doc, server.arg("plain"));
     
     if (error) {
@@ -911,6 +1196,7 @@ void handleWiFiSave() {
     
     if (saveConfig()) {
         TIMED_PRINTLN("WiFi credentials saved: " + String(ssid));
+        logSystemEvent("CONFIG", "WiFi credentials updated for SSID=" + String(ssid));
         server.send(200, "application/json", "{\"success\":true,\"message\":\"Credentials saved\"}");
         
         delay(1000);
@@ -942,7 +1228,7 @@ void handleRoot() {
     }
      
     // Try to serve from LittleFS first, fallback to built-in minimal page
-    if (LittleFS.exists("/index.html")) {
+    if (ensureLittleFS() && LittleFS.exists("/index.html")) {
         File file = LittleFS.open("/index.html", "r");
         if (file) {
             server.streamFile(file, "text/html");
@@ -965,7 +1251,7 @@ void handleJson() {
     server.sendHeader("Cache-Control", "no-cache, max-age=0");
     server.sendHeader("Access-Control-Allow-Origin", "*");
     
-    JsonDocument doc; // ArduinoJson v7 - no size needed
+    StaticJsonDocument<JSON_CAPACITY_MEDIUM> doc;
     
     doc["SheMeterName"] = ShemeterName;
     
@@ -1595,7 +1881,7 @@ void setupWebServer() {
     
     // Time synchronization endpoint
     server.on("/time", []() {
-        JsonDocument doc;
+        StaticJsonDocument<JSON_CAPACITY_MEDIUM> doc;
         doc["deviceMillis"] = millis();
         doc["deviceStartTime"] = deviceStartTimeMillis;
         doc["currentDeviceTime"] = deviceStartTimeMillis + millis();
@@ -1625,7 +1911,7 @@ void setupWebServer() {
     
     // Debug endpoint to check current data and timing
     server.on("/debug", []() {
-        JsonDocument doc;
+        StaticJsonDocument<JSON_CAPACITY_MEDIUM> doc;
         doc["deviceTime"] = millis();
         doc["deviceStartTime"] = deviceStartTimeMillis;
         doc["currentTimestamp"] = deviceStartTimeMillis + millis();
@@ -1718,6 +2004,7 @@ void setupWebServer() {
     
     server.on("/factoryReset", HTTP_POST, []() {
         TIMED_PRINTLN("Factory reset requested");
+        logSystemEvent("RESET", "Factory reset requested via web endpoint");
         
         // Clear NVS (primary storage)
         if (preferences.begin(NVS_NAMESPACE, false)) {
@@ -1735,7 +2022,7 @@ void setupWebServer() {
     
     // Config backup endpoint - download current configuration snapshot
     server.on("/config/download", HTTP_GET, []() {
-        JsonDocument doc;
+        StaticJsonDocument<JSON_CAPACITY_CONFIG> doc;
         doc["ssid"] = ssid;
         doc["password"] = password;
         doc["shellyIP"] = shellyIP;
@@ -1766,7 +2053,7 @@ void setupWebServer() {
             return;
         }
 
-        JsonDocument doc;
+        StaticJsonDocument<JSON_CAPACITY_CONFIG> doc;
         DeserializationError error = deserializeJson(doc, server.arg("plain"));
 
         if (error) {
@@ -1823,18 +2110,20 @@ void setupWebServer() {
 
         if (saveConfig()) {
             TIMED_PRINTLN("Config restored from upload to NVS");
+            logSystemEvent("CONFIG", "Configuration restored from uploaded backup");
             server.send(200, "application/json", "{\"success\":true,\"message\":\"Config restored. Device will reboot.\"}");
             delay(500);
             ESP.restart();
             return;
         } else {
+            logSystemEvent("ERROR", "Failed to persist uploaded configuration");
             server.send(500, "application/json", "{\"success\":false,\"message\":\"Failed to save config\"}");
         }
     });
     
     // Debug endpoint to check LittleFS contents
     server.on("/listfiles", []() {
-        if (!LittleFS.begin()) {
+        if (!ensureLittleFS()) {
             server.send(500, "text/plain", "LittleFS not mounted");
             return;
         }
@@ -1869,7 +2158,7 @@ void setupWebServer() {
     });
     
     // Setup LittleFS and serve files
-    if (LittleFS.begin()) {
+    if (ensureLittleFS()) {
         TIMED_PRINTLN("LittleFS mounted for static file serving");
         
         // Explicit handlers for JavaScript files with proper MIME type
@@ -1943,7 +2232,7 @@ void setupWebServer() {
 // RPC and WebSocket management
 int sendRequest(const char* method, JsonVariant params, std::function<void(JsonObject&)> callback) {
     commandId++;
-    JsonDocument doc; // ArduinoJson v7
+        StaticJsonDocument<JSON_CAPACITY_MEDIUM> doc;
     
     doc["jsonrpc"] = "2.0";
     doc["id"] = commandId;
@@ -1987,7 +2276,7 @@ void sendShellyGetStatus() {
     if (rpcInProgress) return;
     rpcInProgress = true;
     
-    JsonDocument params; // ArduinoJson v7 - empty params
+    StaticJsonDocument<JSON_CAPACITY_SMALL> params;
     sendRequest("Shelly.GetStatus", params.as<JsonVariant>(), [](JsonObject& response) {
         TIMED_PRINTLN("Shelly.GetStatus response received.");
         rpcInProgress = false;
@@ -2026,7 +2315,8 @@ void onMessageCallback(WebsocketsMessage message) {
     TIMED_PRINTLN("Received WebSocket message:");
     TIMED_PRINTLN(message.data());
 
-    JsonDocument doc; // ArduinoJson v7
+    static StaticJsonDocument<JSON_CAPACITY_LARGE> doc;
+    doc.clear();
     DeserializationError error = deserializeJson(doc, message.data());
     
     if (error) {
@@ -2289,6 +2579,7 @@ void checkFactoryResetButton() {
             // Trigger factory reset
             factoryResetTriggered = true;
             TIMED_PRINTLN("=== FACTORY RESET TRIGGERED ===");
+            logSystemEvent("RESET", "Physical factory reset triggered via button");
             
             // Visual confirmation: Fast red blink
             #ifdef USE_WS2812B_FOR_STATUS
@@ -2310,6 +2601,7 @@ void checkFactoryResetButton() {
             }
             
             TIMED_PRINTLN("Factory reset complete. Restarting device...");
+            logSystemEvent("RESET", "Factory reset complete. Restarting device");
             delay(1000);
             ESP.restart();
         }
@@ -2334,6 +2626,9 @@ void checkFactoryResetButton() {
 void setup() {
     Serial.begin(115200);
     delay(2000);  // Give serial time to initialize
+    bootCounter++;
+    deviceStartTimeMillis = millis();
+    recordResetDiagnostics();
     
     // Print boot diagnostics
     TIMED_PRINTLN("=== ENERGY MONITOR BOOT DIAGNOSTICS ===");
@@ -2430,6 +2725,7 @@ void setup() {
             TIMED_PRINTLN("Timezone set to: " + getTimezoneDisplayName(timezone));
             TIMED_PRINTLN("Current time: " + myTZ.dateTime("Y-m-d H:i:s T"));
             timeInitialized = true;
+            updateDeviceStartTimeFromClock();
         } else {
             TIMED_PRINTLN("Failed to set timezone: " + String(timezone));
             timeInitialized = false;
@@ -2501,11 +2797,13 @@ void setup() {
     } else {
         TIMED_PRINTLN("Device accessible at: http://0.0.0.0 (No network connection)");
     }
+    logSystemMetrics(true);
     TIMED_PRINTLN("=== END BOOT DIAGNOSTICS ===");
 }
 
 // Main loop
 void loop() {
+    unsigned long loopStartMicros = micros();
     unsigned long currentMillis = millis();
 
     // Handle DNS requests for captive portal when in AP mode
@@ -2577,6 +2875,12 @@ void loop() {
     
     // Handle ezTime events
     events();
-    
+    unsigned long loopDuration = micros() - loopStartMicros;
+    lastLoopDurationMicros = loopDuration;
+    if (loopDuration > maxLoopDurationMicros) {
+        maxLoopDurationMicros = loopDuration;
+    }
+    monitorMemoryHealth();
+    logSystemMetrics();
     delay(loopDelay);
 }
