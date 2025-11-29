@@ -161,6 +161,11 @@ const size_t LOG_FILE_SIZE_LIMIT = 50 * 1024; // 50 KB per log file
 const unsigned long METRICS_LOG_INTERVAL = 60000;
 const unsigned long LOW_MEMORY_LOG_INTERVAL = 300000;
 const size_t LOW_MEMORY_THRESHOLD = 45000;
+const int SHELLY_PING_FAILURE_THRESHOLD = 3;
+
+int shellyPingFailureCount = 0;
+bool shellyRediscoveryNeeded = false;
+unsigned long lastSuccessfulShellyPing = 0;
 
 // Metrics tracking
 bool littleFSReady = false;
@@ -283,6 +288,7 @@ void loadDefaultConfig();
 bool saveConfig();
 void handleConfig();
 void setupWebServer();
+void handleLogsList();
 void checkWiFiConnection();
 void startAPMode();
 void updateEnergyMeterData();
@@ -708,10 +714,23 @@ void monitorNetworkHealth() {
             IPAddress ip;
             ip.fromString(shellyIP);
             if (!Ping.ping(ip, 1)) { // Single ping with timeout
-                TIMED_PRINTLN("Shelly device unreachable, triggering rediscovery");
-                logSystemEvent("WARN", "Shelly device unreachable at " + String(shellyIP));
-                wsClient.close();
-                strcpy(shellyIP, ""); // Force rediscovery
+                shellyPingFailureCount++;
+                TIMED_PRINTLN("Shelly device ping failed (" + String(shellyPingFailureCount) + "/" + String(SHELLY_PING_FAILURE_THRESHOLD) + ")");
+                if (shellyPingFailureCount >= SHELLY_PING_FAILURE_THRESHOLD) {
+                    TIMED_PRINTLN("Shelly device unreachable, triggering rediscovery");
+                    logSystemEvent("WARN", "Shelly unreachable at " + String(shellyIP) + " after " + String(shellyPingFailureCount) + " failed checks");
+                    wsClient.close();
+                    shellyRediscoveryNeeded = true;
+                    shellyPingFailureCount = 0;
+                    lastWebSocketAttempt = 0; // allow immediate reconnect attempt
+                }
+            } else {
+                if (shellyPingFailureCount > 0) {
+                    logSystemEvent("INFO", "Shelly reachable again after " + String(shellyPingFailureCount) + " failures");
+                }
+                shellyPingFailureCount = 0;
+                shellyRediscoveryNeeded = false;
+                lastSuccessfulShellyPing = millis();
             }
         }
     }
@@ -1216,6 +1235,50 @@ void handleCaptivePortal() {
     } else {
         handleRoot(); // Normal operation
     }
+}
+
+void handleLogsList() {
+    if (!ensureLogDirectory()) {
+        server.send(500, "application/json", "{\"success\":false,\"message\":\"LittleFS not available\"}");
+        return;
+    }
+
+    File dir = LittleFS.open(LOG_DIRECTORY);
+    if (!dir || !dir.isDirectory()) {
+        server.send(500, "application/json", "{\"success\":false,\"message\":\"Logs directory not available\"}");
+        return;
+    }
+
+    String response = "{\"logs\":[";
+    bool first = true;
+    size_t count = 0;
+
+    while (true) {
+        File entry = dir.openNextFile();
+        if (!entry) {
+            break;
+        }
+        if (entry.isDirectory()) {
+            entry.close();
+            continue;
+        }
+        if (!first) {
+            response += ",";
+        }
+        first = false;
+        count++;
+        String name = String(entry.name());
+        if (name.startsWith("/")) {
+            name.remove(0, 1);
+        }
+        response += "{\"name\":\"" + name + "\",\"size\":" + String(entry.size()) + "}";
+        entry.close();
+    }
+    dir.close();
+
+    response += "],\"count\":" + String(count) + "}";
+    server.sendHeader("Cache-Control", "no-cache, max-age=0");
+    server.send(200, "application/json", response);
 }
 
 // Web server handlers
@@ -2157,6 +2220,9 @@ void setupWebServer() {
         server.send(200, "text/plain", output);
     });
     
+    // Structured log listing endpoint
+    server.on("/logs/list", handleLogsList);
+    
     // Setup LittleFS and serve files
     if (ensureLittleFS()) {
         TIMED_PRINTLN("LittleFS mounted for static file serving");
@@ -2427,55 +2493,59 @@ void checkAndEstablishWebSocket() {
 
     checkWiFiConnection();
     
-    // Try stored IP first
-    IPAddress storedIP;
-    bool validStored = false;
-    if (String(shellyIP).length() > 0 && isValidShellyIP(shellyIP)) {
-        storedIP.fromString(shellyIP);
-        if (Ping.ping(storedIP, 1)) {
-            validStored = true;
-            TIMED_PRINTLN("Stored Shelly IP is reachable.");
-        } else {
-            TIMED_PRINTLN("Stored Shelly IP is not reachable.");
-        }
-    }
+    bool connectedThisAttempt = false;
+    bool hasStoredIP = (strlen(shellyIP) > 0 && isValidShellyIP(shellyIP));
     
-    if (validStored) {
+    if (hasStoredIP) {
+        IPAddress storedIP;
+        storedIP.fromString(shellyIP);
+        bool pingOk = Ping.ping(storedIP, 1);
+        TIMED_PRINTLN(pingOk ? "Stored Shelly IP responded to ping." : "Stored Shelly IP did not respond to ping.");
         String wsUrl = String("ws://") + shellyIP + "/rpc";
-        TIMED_PRINTLN("Attempting to reconnect to WebSocket at: " + wsUrl);
-        
+        TIMED_PRINTLN("Attempting WebSocket at stored IP: " + wsUrl);
         if (wsClient.connect(wsUrl)) {
-            TIMED_PRINTLN("Reconnected to WebSocket using stored Shelly IP.");
+            TIMED_PRINTLN("Connected to Shelly WebSocket using stored IP.");
             sendShellyGetStatus();
-            return;
+            connectedThisAttempt = true;
+            shellyRediscoveryNeeded = false;
+            shellyPingFailureCount = 0;
+            lastSuccessfulShellyPing = millis();
         } else {
-            TIMED_PRINTLN("Failed to reconnect using stored Shelly IP.");
+            TIMED_PRINTLN("Failed to connect using stored Shelly IP.");
+            shellyRediscoveryNeeded = true;
         }
     }
 
-    // Discover devices
-    discoverShellyDevices();
-    
-    // Try to connect to discovered devices
-    for (auto& device : shellyDevices) {
-        if (device.type == "3EM") {
-            device.ip.toCharArray(shellyIP, sizeof(shellyIP));
-            String wsUrl = String("ws://") + shellyIP + "/rpc";
-            TIMED_PRINTLN("Connecting to " + device.type + " at: " + wsUrl);
-            
-            if (wsClient.connect(wsUrl)) {
-                TIMED_PRINTLN("Connected to " + device.type + " WebSocket after discovery.");
-                device.isActive = true;
-                if (shellyDevices.size() == 1) {
-            saveConfig();
+    bool shouldDiscover = !connectedThisAttempt && (shellyRediscoveryNeeded || !hasStoredIP);
+    if (shouldDiscover) {
+        discoverShellyDevices();
+        
+        for (auto& device : shellyDevices) {
+            if (device.type == "3EM") {
+                device.ip.toCharArray(shellyIP, sizeof(shellyIP));
+                String wsUrl = String("ws://") + shellyIP + "/rpc";
+                TIMED_PRINTLN("Connecting to " + device.type + " at: " + wsUrl);
+                
+                if (wsClient.connect(wsUrl)) {
+                    TIMED_PRINTLN("Connected to " + device.type + " WebSocket after discovery.");
+                    device.isActive = true;
+                    if (shellyDevices.size() == 1) {
+                        saveConfig();
+                    }
+                    sendShellyGetStatus();
+                    connectedThisAttempt = true;
+                    shellyRediscoveryNeeded = false;
+                    shellyPingFailureCount = 0;
+                    lastSuccessfulShellyPing = millis();
+                    break;
                 }
-                sendShellyGetStatus();
-                return;
             }
         }
     }
     
-    TIMED_PRINTLN("No valid Shelly 3EM device found or connection failed.");
+    if (!connectedThisAttempt) {
+        TIMED_PRINTLN("No valid Shelly 3EM device found or connection failed.");
+    }
 }
 
 // Data management
