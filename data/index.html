@@ -542,13 +542,13 @@
 
     const ctx24h = document.getElementById('chart24h').getContext('2d');
     energyChart24h = new Chart(ctx24h, {
-      type: 'line',
+      type: 'bar',
       data: {
         labels: [],
         datasets: [
-          { label: 'Grid', data: [], borderColor: '#e67e22', backgroundColor: 'rgba(230, 126, 34, 0.15)', fill: true },
-          { label: 'Solar', data: [], borderColor: '#2ecc71', backgroundColor: 'rgba(46, 204, 113, 0.15)', fill: true },
-          { label: 'Consumer', data: [], borderColor: '#1abc9c', backgroundColor: 'rgba(26, 188, 156, 0.15)', fill: true }
+          { label: 'Grid', data: [], backgroundColor: 'rgba(230, 126, 34, 0.7)', borderRadius: 4 },
+          { label: 'Solar', data: [], backgroundColor: 'rgba(46, 204, 113, 0.7)', borderRadius: 4 },
+          { label: 'Consumer', data: [], backgroundColor: 'rgba(26, 188, 156, 0.7)', borderRadius: 4 }
         ]
       },
       options: {
@@ -557,11 +557,16 @@
         interaction: { intersect: false, mode: 'index' },
         scales: {
           x: {
+            stacked: true,
             type: 'time',
             time: { parser: 'YYYYMMDDTHHmmssSSS', unit: 'hour', displayFormats: { hour: 'MMM D HH:mm' } },
             title: { display: true, text: 'Time' }
           },
-          y: { title: { display: true, text: 'Power (W)' }, beginAtZero: true }
+          y: {
+            stacked: true,
+            title: { display: true, text: 'Power (W)' },
+            beginAtZero: true
+          }
         },
         plugins: { legend: { position: 'bottom' } }
       }
@@ -573,9 +578,9 @@
       data: {
         labels: [],
         datasets: [
-          { label: 'Grid', data: [], backgroundColor: 'rgba(231, 76, 60, 0.6)' },
-          { label: 'Solar', data: [], backgroundColor: 'rgba(39, 174, 96, 0.6)' },
-          { label: 'Consumer', data: [], backgroundColor: 'rgba(52, 152, 219, 0.6)' }
+          { label: 'Grid', data: [], backgroundColor: 'rgba(231, 76, 60, 0.7)', borderRadius: 4 },
+          { label: 'Solar', data: [], backgroundColor: 'rgba(39, 174, 96, 0.7)', borderRadius: 4 },
+          { label: 'Consumer', data: [], backgroundColor: 'rgba(52, 152, 219, 0.7)', borderRadius: 4 }
         ]
       },
       options: {
@@ -590,7 +595,8 @@
           },
           y: {
             stacked: true,
-            title: { display: true, text: 'Power (W)' }
+            title: { display: true, text: 'Power (W)' },
+            beginAtZero: true
           }
         },
         plugins: { legend: { position: 'bottom' } }
