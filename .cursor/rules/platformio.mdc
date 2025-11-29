@@ -1,0 +1,23 @@
+---
+description: USE WHEN running PlatformIO serial‑monitor commands
+alwaysApply: true           # always inject – small and harmless
+---
+
+RULE: cmd→nonblocking‑pio‑monitor
+- Whenever the command to be executed **starts with** `pio device monitor`
+  (or its alias `platformio device monitor`), you **MUST** run it in a
+  non‑blocking way so that Cursor does not wait for SIGINT:
+  1. **Preferred:**  
+     `timeout 20s sh -c 'pio device monitor $@'`  
+     (↳ returns after 20 s; adjust to taste)
+  2. **Alternative (Linux/macOS):**  
+     `nohup pio device monitor "$@" >/tmp/pio‑monitor.log 2>&1 &`
+  3. **Alternative (WSL/Unix shells):**  
+     `( pio device monitor "$@" & )`
+- Never send `CTRL+C` / SIGINT from the agent.  The user will stop the
+  monitor manually if needed.
+- Show the user where the output goes (e.g. tail the log once, then exit).
+- **Example** that satisfies the rule:  
+  `timeout 20s sh -c 'pio device monitor -p /dev/ttyUSB0 -b 115200'`  ✓
+- **Counter‑example** (blocks indefinitely, so DO NOT use):  
+  `pio device monitor`  ✗
