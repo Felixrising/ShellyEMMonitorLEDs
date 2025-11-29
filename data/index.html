@@ -259,6 +259,23 @@
       height: 360px;
     }
     
+    .chart-actions {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      background: rgba(255,255,255,0.9);
+      border-radius: 10px;
+      padding: 12px 16px;
+      margin-bottom: 25px;
+      box-shadow: 0 4px 18px rgba(0,0,0,0.08);
+    }
+    
+    .chart-actions span {
+      font-size: 0.9em;
+      color: #555;
+    }
+    
     .chart-title {
       font-size: 1.5em;
       font-weight: 600;
@@ -345,6 +362,11 @@
       <div class="chart-container compact">
         <div class="chart-title">Last 30 Days (Daily averages)</div>
         <canvas id="chart30d"></canvas>
+      </div>
+
+      <div class="chart-actions">
+        <button class="btn btn-secondary" onclick="clearHistoryData()">Clear Stored History</button>
+        <span id="historyClearStatus">Clears 1h, 24h, and 30d datasets</span>
       </div>
       
       <!-- Uptime Display in Bottom Left -->
@@ -606,12 +628,12 @@
       let downsampled = [];
       if(data.length === 0) return downsampled;
 
-      let bucketStart = moment(data[0].timestamp, "YYYYMMDDTHHmmssSSS");
+      let bucketStart = moment.utc(data[0].timestamp, "YYYYMMDDTHHmmssSSS");
       let bucketEnd = bucketStart.clone().add(intervalSeconds, 'seconds');
       let bucket = { timestamp: bucketStart.format("YYYYMMDDTHHmmssSSS"), Grid: 0, Solar: 0, Consumer: 0, count: 0 };
 
       data.forEach(point => {
-        let pointTime = moment(point.timestamp, "YYYYMMDDTHHmmssSSS");
+        let pointTime = moment.utc(point.timestamp, "YYYYMMDDTHHmmssSSS");
         if(pointTime.isBefore(bucketEnd)) {
           bucket.Grid += point.Grid;
           bucket.Solar += point.Solar;
@@ -723,14 +745,14 @@
           
           // Sort history data by timestamp to ensure chronological order
           downsampledData.sort((a, b) => {
-            const timeA = moment(a.timestamp, "YYYYMMDDTHHmmssSSS");
-            const timeB = moment(b.timestamp, "YYYYMMDDTHHmmssSSS");
+            const timeA = moment.utc(a.timestamp, "YYYYMMDDTHHmmssSSS");
+            const timeB = moment.utc(b.timestamp, "YYYYMMDDTHHmmssSSS");
             return timeA.valueOf() - timeB.valueOf();
           });
           
           console.log("Loading history points in chronological order:");
           downsampledData.forEach((point, index) => {
-            let timeLabel = moment(point.timestamp, "YYYYMMDDTHHmmssSSS").toDate();
+            let timeLabel = moment.utc(point.timestamp, "YYYYMMDDTHHmmssSSS").toDate();
             
             // Validate timestamp before adding
             if (!isValidTimestamp(timeLabel)) {
@@ -750,7 +772,7 @@
 
           // Store the last history timestamp for comparison with real-time data
           if (downsampledData.length > 0) {
-            window.lastHistoryTimestamp = moment(downsampledData[downsampledData.length - 1].timestamp, "YYYYMMDDTHHmmssSSS").toDate();
+            window.lastHistoryTimestamp = moment.utc(downsampledData[downsampledData.length - 1].timestamp, "YYYYMMDDTHHmmssSSS").toDate();
             console.log("Last history timestamp:", window.lastHistoryTimestamp.toISOString());
           }
 
@@ -797,7 +819,7 @@
       chart.data.labels = [];
       chart.data.datasets.forEach(ds => ds.data = []);
       data.forEach(point => {
-        const timeLabel = moment(point.timestamp, "YYYYMMDDTHHmmssSSS").toDate();
+        const timeLabel = moment.utc(point.timestamp, "YYYYMMDDTHHmmssSSS").toDate();
         chart.data.labels.push(timeLabel);
         chart.data.datasets[0].data.push(point.Grid);
         chart.data.datasets[1].data.push(point.Solar);
@@ -814,7 +836,7 @@
           return response.json();
         })
         .then(data => {
-          data.sort((a, b) => moment(a.timestamp, "YYYYMMDDTHHmmssSSS").valueOf() - moment(b.timestamp, "YYYYMMDDTHHmmssSSS").valueOf());
+      data.sort((a, b) => moment.utc(a.timestamp, "YYYYMMDDTHHmmssSSS").valueOf() - moment.utc(b.timestamp, "YYYYMMDDTHHmmssSSS").valueOf());
           updateTrendChart(energyChart24h, data);
         })
         .catch(error => console.error("24h history load failed:", error));
@@ -828,10 +850,87 @@
           return response.json();
         })
         .then(data => {
-          data.sort((a, b) => moment(a.timestamp, "YYYYMMDDTHHmmssSSS").valueOf() - moment(b.timestamp, "YYYYMMDDTHHmmssSSS").valueOf());
+      data.sort((a, b) => moment.utc(a.timestamp, "YYYYMMDDTHHmmssSSS").valueOf() - moment.utc(b.timestamp, "YYYYMMDDTHHmmssSSS").valueOf());
           updateTrendChart(energyChart30d, data);
         })
         .catch(error => console.error("30d history load failed:", error));
+    }
+
+    function addRealtimePoint(timeLabel, gridPower, solarPower, consumerPower, animationMode = 'none') {
+      if (!energyChart) return;
+      const labels = energyChart.data.labels;
+      let insertIdx = labels.length;
+      for (let i = labels.length - 1; i >= 0; i--) {
+        if (timeLabel >= labels[i]) {
+          insertIdx = i + 1;
+          break;
+        }
+        if (i === 0) {
+          insertIdx = 0;
+        }
+      }
+
+      const insertData = (dataset, value) => dataset.data.splice(insertIdx, 0, value);
+
+      if (insertIdx === labels.length) {
+        labels.push(timeLabel);
+        energyChart.data.datasets[0].data.push(gridPower);
+        energyChart.data.datasets[1].data.push(solarPower);
+        energyChart.data.datasets[2].data.push(consumerPower);
+      } else {
+        labels.splice(insertIdx, 0, timeLabel);
+        energyChart.data.datasets.forEach((dataset, idx) => {
+          const value = idx === 0 ? gridPower : idx === 1 ? solarPower : consumerPower;
+          insertData(dataset, value);
+        });
+      }
+
+      while (labels.length > 300) {
+        labels.shift();
+        energyChart.data.datasets.forEach(dataset => dataset.data.shift());
+      }
+
+      cleanChartData();
+      energyChart.update(animationMode);
+    }
+    
+    function clearHistoryData() {
+      if (!confirm('Clear stored history for 1h, 24h, and 30d datasets?')) return;
+      const statusEl = document.getElementById('historyClearStatus');
+      statusEl.innerText = 'Clearing history...';
+      fetch('/history/reset', { method: 'POST' })
+        .then(response => {
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          return response.json().catch(() => ({ success: true }));
+        })
+        .then(() => {
+          statusEl.innerText = 'History cleared';
+          isFullHistoryLoaded = false;
+          if (energyChart) {
+            energyChart.data.labels = [];
+            energyChart.data.datasets.forEach(ds => ds.data = []);
+            energyChart.update('none');
+          }
+          if (energyChart24h) {
+            energyChart24h.data.labels = [];
+            energyChart24h.data.datasets.forEach(ds => ds.data = []);
+            energyChart24h.update('none');
+          }
+          if (energyChart30d) {
+            energyChart30d.data.labels = [];
+            energyChart30d.data.datasets.forEach(ds => ds.data = []);
+            energyChart30d.update('none');
+          }
+          loadHistoryQuick();
+          loadHistory24h();
+          loadHistory30d();
+          setTimeout(() => statusEl.innerText = 'Clears 1h, 24h, and 30d datasets', 4000);
+        })
+        .catch(error => {
+          console.error("Failed to clear history:", error);
+          statusEl.innerText = `Error clearing history: ${error.message}`;
+          setTimeout(() => statusEl.innerText = 'Clears 1h, 24h, and 30d datasets', 6000);
+        });
     }
 
     // Use lightweight endpoint for frequent updates
@@ -881,19 +980,9 @@
                gridStatus.style.color = '#e74c3c'; // Red for import
            }
 
-           // Add to chart (simplified)
-           let timeLabel = new Date();
-           energyChart.data.labels.push(timeLabel);
-           energyChart.data.datasets[0].data.push(gridPower);
-           energyChart.data.datasets[1].data.push(solarPower);
-           energyChart.data.datasets[2].data.push(consumerPower);
-
-           if (energyChart.data.labels.length > 300) {
-             energyChart.data.labels.shift();
-             energyChart.data.datasets.forEach(dataset => dataset.data.shift());
-           }
-
-           energyChart.update('none'); // No animation for frequent updates
+           const sourceTimestamp = data.timestamp ? Number(data.timestamp) : Date.now();
+           let timeLabel = new Date(sourceTimestamp);
+           addRealtimePoint(timeLabel, gridPower, solarPower, consumerPower, 'none');
         })
                  .catch(error => {
             clearTimeout(timeoutId);
@@ -969,8 +1058,9 @@
                document.getElementById('uptimeValue').innerText = 'Uptime: ' + data.uptime;
            }
 
-           // Use consistent timestamp for chart data
-           let timeLabel = new Date();
+           // Use timestamp from device/Shelly if provided
+           const sourceTimestamp = data.timestamp ? Number(data.timestamp) : Date.now();
+           let timeLabel = new Date(sourceTimestamp);
            
            // Validate timestamp before adding
            if (!isValidTimestamp(timeLabel)) {
@@ -994,21 +1084,7 @@
            }
            
            console.log(`Adding chart point at ${timeLabel.toISOString()}: Grid=${gridPower}W, Solar=${solarPower}W, Consumer=${consumerPower}W`);
-           
-           energyChart.data.labels.push(timeLabel);
-           energyChart.data.datasets[0].data.push(gridPower);
-           energyChart.data.datasets[1].data.push(solarPower);
-           energyChart.data.datasets[2].data.push(consumerPower);
-
-           if (energyChart.data.labels.length > 300) {
-             energyChart.data.labels.shift();
-             energyChart.data.datasets.forEach(dataset => dataset.data.shift());
-           }
-
-           // Clean any invalid data before updating
-           cleanChartData();
-           
-           energyChart.update();
+           addRealtimePoint(timeLabel, gridPower, solarPower, consumerPower);
            console.log(`Chart updated. Total points: ${energyChart.data.labels.length}`);
         })
         .catch(error => {

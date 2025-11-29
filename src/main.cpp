@@ -87,6 +87,9 @@ bool inSetup = true;
 bool rpcInProgress = false;
 bool newDataAvailable = false;
 uint64_t deviceStartTimeMillis = 0;
+bool shellySubscribed = false;
+uint64_t lastShellyTimestampMs = 0;
+int32_t localTimezoneOffsetSeconds = 0;
 
 // Configuration defaults
 const char* defaultSSID = "";
@@ -236,6 +239,7 @@ int LED_COUNT_var = 60;
 int LED_PIN_var = 4;
 uint32_t LED_TYPE_flags = NEO_GRBW + NEO_KHZ800;
 bool invertStrip = false;
+bool activePollingEnabled = false;
 
 // LED Type definitions for common ICs
 struct LEDType {
@@ -337,11 +341,13 @@ int sendRequest(const char* method, JsonVariant params, std::function<void(JsonO
 void onMessageCallback(WebsocketsMessage message);
 void handleWebSocketEvent(WebsocketsEvent event, String data);
 void sendShellyGetStatus();
+void subscribeToShellyUpdates();
+void startShellySession();
 void checkAndEstablishWebSocket();
 bool isValidShellyHostname(const String& host);
 bool isValidShellyIP(const char* ip);
 void updateMeterActPower(int meterIndex, int newPower);
-void storeDataPoint(uint32_t timestampEpoch);
+void storeDataPoint(uint64_t timestampMillis);
 void handleHistory();
 void handleHistory24h();
 void handleHistory30d();
@@ -366,13 +372,17 @@ bool loadAggregatedHistory(const char* path, AggregatedPoint* buffer, int maxRec
 void persistAggregatedHistory(const char* path, AggregatedPoint* buffer, int maxRecords, int writeIndex, bool filled);
 void loadStoredHistories();
 String formatTimestampString(uint32_t epochSeconds);
-uint32_t extractShellyTimestamp(JsonObject root);
+void updateTimezoneOffset(JsonObjectConst sysObj);
+uint64_t extractShellyTimestampMs(JsonVariantConst root);
 void cleanupOldLogs();
 void trimLogFile(const String& path);
 String getLogFilePath();
 void logSystemEvent(const char* level, const String& message);
 void logSystemMetrics(bool force = false);
 void monitorMemoryHealth();
+void updateTimezoneOffset(JsonObjectConst sysObj);
+uint64_t extractShellyTimestampMs(JsonVariantConst root);
+void resetHistoricalData();
 String resetReasonToString(esp_reset_reason_t reason);
 void recordResetDiagnostics();
 void updateDeviceStartTimeFromClock();
@@ -749,6 +759,38 @@ void loadStoredHistories() {
     bool loaded30d = loadAggregatedHistory(HISTORY_30D_FILE, history30d, HISTORY_30D_BUCKETS, history30dIndex, history30dFilled);
     TIMED_PRINTLN(String("History 24h loaded: ") + (loaded24h ? "yes" : "no"));
     TIMED_PRINTLN(String("History 30d loaded: ") + (loaded30d ? "yes" : "no"));
+}
+
+void resetHistoricalData() {
+    memset(shortHistory, 0, sizeof(shortHistory));
+    shortHistoryIndex = 0;
+    shortHistoryFilled = false;
+    lastShortHistoryTimestamp = 0;
+    
+    memset(history24h, 0, sizeof(history24h));
+    history24hIndex = 0;
+    history24hFilled = false;
+    bucket24h.bucketStart = 0;
+    bucket24h.sampleCount = 0;
+    bucket24h.gridSum = bucket24h.solarSum = bucket24h.consumerSum = 0;
+    
+    memset(history30d, 0, sizeof(history30d));
+    history30dIndex = 0;
+    history30dFilled = false;
+    bucket30d.bucketStart = 0;
+    bucket30d.sampleCount = 0;
+    bucket30d.gridSum = bucket30d.solarSum = bucket30d.consumerSum = 0;
+    
+    if (ensureHistoryDirectory()) {
+        if (LittleFS.exists(HISTORY_24H_FILE)) {
+            LittleFS.remove(HISTORY_24H_FILE);
+        }
+        if (LittleFS.exists(HISTORY_30D_FILE)) {
+            LittleFS.remove(HISTORY_30D_FILE);
+        }
+    }
+    
+    logSystemEvent("HISTORY", "Historical data cleared via web request");
 }
 // Validation functions
 bool validateConfig() {
@@ -1466,10 +1508,14 @@ void handleJson() {
     if (timeInitialized) {
         doc["currentTime"] = myTZ.dateTime("Y-m-d H:i:s T");
         doc["timezone"] = getTimezoneDisplayName(timezone);
+        doc["timezoneOffsetSeconds"] = localTimezoneOffsetSeconds;
     } else {
         doc["currentTime"] = "Time not synchronized";
         doc["timezone"] = "Unknown";
     }
+    
+    uint64_t timestampMs = lastShellyTimestampMs > 0 ? lastShellyTimestampMs : (deviceStartTimeMillis + millis());
+    doc["timestamp"] = timestampMs;
     
     JsonArray metersArray = doc["meters"].to<JsonArray>();
     
@@ -1509,6 +1555,7 @@ bool loadConfigNVS() {
         LED_PIN_var = preferences.getInt("ledPin", 4);
         LED_TYPE_flags = preferences.getUInt("ledType", NEO_GRBW + NEO_KHZ800);
         invertStrip = preferences.getBool("invertStrip", false);
+        activePollingEnabled = preferences.getBool("activePoll", false);
         
         // Load meter names
         meters[0].name = preferences.getString("meter0", "Grid");
@@ -1557,6 +1604,7 @@ bool saveConfigNVS() {
     preferences.putInt("ledPin", LED_PIN_var);
     preferences.putUInt("ledType", LED_TYPE_flags);
     preferences.putBool("invertStrip", invertStrip);
+    preferences.putBool("activePoll", activePollingEnabled);
     
     // Save meter names
     preferences.putString("meter0", meters[0].name.c_str());
@@ -1591,6 +1639,7 @@ void loadDefaultConfig() {
     LED_TYPE_flags = NEO_GRBW + NEO_KHZ800;
     currentLEDTypeIndex = findLEDTypeIndex(LED_TYPE_flags);
     invertStrip = false;
+    activePollingEnabled = false;
 
     validateConfig();
 }
@@ -1616,6 +1665,7 @@ void handleConfig() {
         String ledPinStr = server.arg("ledPin");
         String ledTypeStr = server.arg("ledType");
         bool ledInvert = server.hasArg("invertStrip");
+        bool newActivePolling = server.hasArg("activePolling");
 
         bool valid = true;
         String errorMsg = "";
@@ -1696,6 +1746,7 @@ void handleConfig() {
             LED_TYPE_flags = newLedType;
             currentLEDTypeIndex = ledTypeIndex;
             invertStrip = ledInvert;
+        activePollingEnabled = newActivePolling;
 
             // Reinitialize LED strip with new configuration
             initializeLEDStrip();
@@ -1837,6 +1888,13 @@ void handleConfig() {
         html += "<div class='current-config' style='background: #f5f5f5; padding: 15px; border-radius: 8px; margin-top: 15px;'>";
         html += "<strong>Current LED Configuration:</strong><br>";
         html += "Type: " + getLEDTypeName(LED_TYPE_flags) + " | Count: " + String(LED_COUNT_var) + " | Pin: GPIO" + String(LED_PIN_var) + " | Inverted: " + String(invertStrip ? "Yes" : "No");
+        html += "</div>";
+
+        html += "<div class='section-title' style='margin-top: 30px;'>Data Collection</div>";
+        html += "<div class='form-group' style='display:flex;align-items:flex-start;gap:12px;background:#fdfdfd;padding:12px;border-radius:8px;border:1px solid #e0e0e0;'>";
+        html += "<input type='checkbox' name='activePolling'" + String(activePollingEnabled ? " checked" : "") + " style='width:auto;margin-top:6px;'>";
+        html += "<div><label style='font-weight:600;'>Enable active 1-second polling</label>";
+        html += "<p style='margin:4px 0 0;font-size:0.9em;color:#555;'>When disabled the monitor relies on Shelly push updates (triggered on ~5% change) and only performs a status poll when reconnecting. Enable this if you need guaranteed 1-second samples.</p></div>";
         html += "</div>";
         
         html += "<div style='margin-top: 30px;'>";
@@ -2080,6 +2138,11 @@ void setupWebServer() {
     server.on("/history", HTTP_GET, handleHistory);
     server.on("/history/24h", HTTP_GET, handleHistory24h);
     server.on("/history/30d", HTTP_GET, handleHistory30d);
+    server.on("/history/reset", HTTP_POST, []() {
+        resetHistoricalData();
+        server.sendHeader("Access-Control-Allow-Origin", "*");
+        server.send(200, "application/json", "{\"success\":true}");
+    });
     
     // Captive portal - catch all unknown requests
     server.onNotFound(handleCaptivePortal);
@@ -2090,7 +2153,8 @@ void setupWebServer() {
         server.sendHeader("Access-Control-Allow-Origin", "*");
         
         // Minimal JSON for real-time updates
-        String response = "{\"meters\":[";
+        uint64_t timestampMs = lastShellyTimestampMs > 0 ? lastShellyTimestampMs : (deviceStartTimeMillis + millis());
+        String response = "{\"timestamp\":" + String((unsigned long long)timestampMs) + ",\"meters\":[";
         for (int i = 0; i < 3; i++) {
             if (i > 0) response += ",";
             response += "{\"name\":\"" + meters[i].name + "\",\"power\":" + String(meters[i].act_power) + "}";
@@ -2123,8 +2187,8 @@ void setupWebServer() {
         doc["timezone"] = String(timezone);
         doc["timezoneDisplay"] = getTimezoneDisplayName(timezone);
         doc["timeInitialized"] = timeInitialized;
-        
         if (timeInitialized) {
+            doc["timezoneOffsetSeconds"] = localTimezoneOffsetSeconds;
             doc["currentTime"] = myTZ.dateTime("Y-m-d H:i:s T");
             doc["utcTime"] = UTC.dateTime("Y-m-d H:i:s");
             doc["epoch"] = myTZ.now();
@@ -2146,6 +2210,8 @@ void setupWebServer() {
         doc["wsConnected"] = wsClient.available();
         doc["rpcInProgress"] = rpcInProgress;
         doc["newDataAvailable"] = newDataAvailable;
+        doc["activePollingEnabled"] = activePollingEnabled;
+        doc["lastShellyTimestamp"] = lastShellyTimestampMs;
         
         // Add uptime information
         unsigned long uptimeSeconds = millis() / 1000;
@@ -2159,6 +2225,7 @@ void setupWebServer() {
         if (timeInitialized) {
             doc["currentTime"] = myTZ.dateTime("Y-m-d H:i:s T");
             doc["utcTime"] = UTC.dateTime("Y-m-d H:i:s");
+            doc["timezoneOffsetSeconds"] = localTimezoneOffsetSeconds;
         }
         
         JsonArray metersArray = doc["meters"].to<JsonArray>();
@@ -2265,6 +2332,7 @@ void setupWebServer() {
         doc["ledPin"] = LED_PIN_var;
         doc["ledType"] = LED_TYPE_flags;
         doc["invertStrip"] = invertStrip;
+        doc["activePolling"] = activePollingEnabled;
 
         JsonArray meterArray = doc["meters"].to<JsonArray>();
         for (int i = 0; i < 3; i++) {
@@ -2321,6 +2389,7 @@ void setupWebServer() {
             currentLEDTypeIndex = findLEDTypeIndex(LED_TYPE_flags);
         }
         if (doc["invertStrip"].is<bool>()) invertStrip = doc["invertStrip"];
+        if (doc["activePolling"].is<bool>()) activePollingEnabled = doc["activePolling"];
 
         if (doc["meters"].is<JsonArray>()) {
             JsonArray meterArray = doc["meters"].as<JsonArray>();
@@ -2517,7 +2586,7 @@ void sendShellyGetStatus() {
         TIMED_PRINTLN("Shelly.GetStatus response received.");
         rpcInProgress = false;
 
-        uint32_t shellyTimestamp = extractShellyTimestamp(response);
+        uint64_t shellyTimestamp = extractShellyTimestampMs(response);
         if (response["result"].is<JsonObject>()) {
             JsonObject result = response["result"];
             
@@ -2545,6 +2614,29 @@ void sendShellyGetStatus() {
         storeDataPoint(shellyTimestamp);
         }
     });
+}
+
+void subscribeToShellyUpdates() {
+    if (shellySubscribed) {
+        return;
+    }
+    StaticJsonDocument<JSON_CAPACITY_SMALL> params;
+    JsonArray events = params.createNestedArray("events");
+    JsonObject evt = events.createNestedObject();
+    evt["event"] = "NotifyStatus";
+    evt["component"] = "*";
+    
+    sendRequest("Shelly.Subscribe", params.as<JsonVariant>(), [](JsonObject& response) {
+        shellySubscribed = true;
+        TIMED_PRINTLN("Shelly.Subscribe acknowledged.");
+        logSystemEvent("RPC", "Subscribed to Shelly NotifyStatus events");
+    });
+}
+
+void startShellySession() {
+    shellySubscribed = false;
+    sendShellyGetStatus();
+    subscribeToShellyUpdates();
 }
 
 void onMessageCallback(WebsocketsMessage message) {
@@ -2585,7 +2677,7 @@ void onMessageCallback(WebsocketsMessage message) {
                     }
                 }
             }
-            uint32_t shellyTimestamp = extractShellyTimestamp(doc);
+            uint64_t shellyTimestamp = extractShellyTimestampMs(doc);
             storeDataPoint(shellyTimestamp);
         }
     } else if (doc["id"].is<int>()) {
@@ -2607,10 +2699,12 @@ void handleWebSocketEvent(WebsocketsEvent event, String data) {
     case WebsocketsEvent::ConnectionOpened:
         TIMED_PRINTLN("WebSocket connection opened.");
         lastWSActivity = millis();
+    shellySubscribed = false;
         break;
     case WebsocketsEvent::ConnectionClosed:
         TIMED_PRINTLN("WebSocket connection closed.");
         cleanupPendingRequests();
+    shellySubscribed = false;
         break;
     case WebsocketsEvent::GotPing:
         TIMED_PRINTLN("WebSocket ping received. Replied Pong.");
@@ -2677,7 +2771,7 @@ void checkAndEstablishWebSocket() {
         TIMED_PRINTLN("Attempting WebSocket at stored IP: " + wsUrl);
         if (wsClient.connect(wsUrl)) {
             TIMED_PRINTLN("Connected to Shelly WebSocket using stored IP.");
-            sendShellyGetStatus();
+            startShellySession();
             connectedThisAttempt = true;
             shellyRediscoveryNeeded = false;
             shellyPingFailureCount = 0;
@@ -2704,7 +2798,7 @@ void checkAndEstablishWebSocket() {
                     if (shellyDevices.size() == 1) {
                         saveConfig();
                     }
-                    sendShellyGetStatus();
+                    startShellySession();
                     connectedThisAttempt = true;
                     shellyRediscoveryNeeded = false;
                     shellyPingFailureCount = 0;
@@ -2800,10 +2894,16 @@ void processAggregationSample(BucketState& state, uint32_t timestampEpoch, int g
     state.sampleCount++;
 }
 
-void storeDataPoint(uint32_t timestampEpoch) {
-    if (timestampEpoch == 0) {
-        timestampEpoch = timeInitialized ? myTZ.now() : (millis() / 1000UL);
+void storeDataPoint(uint64_t timestampMillis) {
+    if (timestampMillis == 0) {
+        if (timeInitialized) {
+            timestampMillis = static_cast<uint64_t>(myTZ.now()) * 1000ULL;
+        } else {
+            timestampMillis = deviceStartTimeMillis + millis();
+        }
     }
+    lastShellyTimestampMs = timestampMillis;
+    uint32_t timestampEpoch = static_cast<uint32_t>(timestampMillis / 1000ULL);
     
     int gridVal = 0;
     int solarVal = 0;
@@ -2840,35 +2940,70 @@ String formatTimestampString(uint32_t epochSeconds) {
     return String(fullTimestamp);
 }
 
-uint32_t extractShellyTimestamp(JsonObject root) {
-    if (root["ts"].is<uint32_t>()) {
-        return root["ts"].as<uint32_t>();
+void updateTimezoneOffset(JsonObjectConst sysObj) {
+    if (!sysObj.isNull() && sysObj["utc_offset"].is<int>()) {
+        localTimezoneOffsetSeconds = sysObj["utc_offset"].as<int32_t>();
     }
-    if (root["params"].is<JsonObject>()) {
-        JsonObject params = root["params"];
-        if (params["ts"].is<uint32_t>()) {
-            return params["ts"].as<uint32_t>();
+}
+
+uint64_t extractShellyTimestampMs(JsonVariantConst root) {
+    double tsSeconds = 0.0;
+    bool tsFound = false;
+    
+    if (root.isNull()) {
+        tsSeconds = timeInitialized ? myTZ.now() : ((deviceStartTimeMillis + millis()) / 1000.0);
+        return static_cast<uint64_t>(tsSeconds * 1000.0);
+    }
+    
+    JsonObjectConst params = root["params"];
+    if (!params.isNull()) {
+        if (params["ts"].is<float>() || params["ts"].is<double>()) {
+            tsSeconds = params["ts"].as<double>();
+            tsFound = tsSeconds > 0;
         }
-        if (params["sys"].is<JsonObject>() && params["sys"]["unixtime"].is<uint32_t>()) {
-            return params["sys"]["unixtime"].as<uint32_t>();
+        JsonObjectConst sysObj = params["sys"];
+        updateTimezoneOffset(sysObj);
+        if (!tsFound && !sysObj.isNull() && sysObj["unixtime"].is<long>()) {
+            tsSeconds = static_cast<double>(sysObj["unixtime"].as<long>());
+            tsFound = true;
         }
     }
-    if (root["result"].is<JsonObject>()) {
-        JsonObject result = root["result"];
-        if (result["ts"].is<uint32_t>()) {
-            return result["ts"].as<uint32_t>();
+    
+    JsonObjectConst result = root["result"];
+    if (!result.isNull()) {
+        if (result["ts"].is<float>() || result["ts"].is<double>()) {
+            tsSeconds = result["ts"].as<double>();
+            tsFound = tsSeconds > 0;
         }
-        if (result["sys"].is<JsonObject>() && result["sys"]["unixtime"].is<uint32_t>()) {
-            return result["sys"]["unixtime"].as<uint32_t>();
+        JsonObjectConst sysObj = result["sys"];
+        updateTimezoneOffset(sysObj);
+        if (!sysObj.isNull() && sysObj["unixtime"].is<long>()) {
+            tsSeconds = static_cast<double>(sysObj["unixtime"].as<long>());
+            tsFound = true;
         }
     }
-    if (root["sys"].is<JsonObject>() && root["sys"]["unixtime"].is<uint32_t>()) {
-        return root["sys"]["unixtime"].as<uint32_t>();
+    
+    JsonObjectConst sysObj = root["sys"];
+    updateTimezoneOffset(sysObj);
+    if (!tsFound && !sysObj.isNull() && sysObj["unixtime"].is<long>()) {
+        tsSeconds = static_cast<double>(sysObj["unixtime"].as<long>());
+        tsFound = true;
     }
-    if (timeInitialized) {
-        return myTZ.now();
+    
+    if (!tsFound && root["ts"].is<float>()) {
+        tsSeconds = root["ts"].as<double>();
+        tsFound = tsSeconds > 0;
     }
-    return millis() / 1000UL;
+    
+    if (!tsFound) {
+        tsSeconds = timeInitialized ? myTZ.now() : ((deviceStartTimeMillis + millis()) / 1000.0);
+    }
+    
+    if (tsSeconds < 0) {
+        tsSeconds = 0;
+    }
+    
+    return static_cast<uint64_t>(tsSeconds * 1000.0);
 }
 
 void updateEnergyMeterData() {
@@ -3149,7 +3284,7 @@ void setup() {
         
         if (wsClient.connect(wsUrl)) {
             TIMED_PRINTLN("Connected to Shelly WebSocket");
-            sendShellyGetStatus();
+            startShellySession();
         } else {
             TIMED_PRINTLN("Failed to connect to Shelly WebSocket");
         }
@@ -3200,7 +3335,11 @@ void loop() {
         if (!wsClient.available()) {
             checkAndEstablishWebSocket();
         } else {
-            updateEnergyMeterData();
+            if (activePollingEnabled) {
+                updateEnergyMeterData();
+            } else {
+                cleanupExpiredRequests();
+            }
             }
         }
     }
