@@ -23,7 +23,17 @@ This device aims to assist homeowners in optimizing their use of renewable energ
 * Provides an interactive web interface for historical data visualization
 * Features an intuitive LED strip display for immediate energy status feedback
 
-### New in Version 2.0-RC2
+### New in Version 2.0-RC3
+* **Persistent 24 h / 30 d History**: Rolling 30‑minute and daily averages are written to LittleFS, reloaded on boot, and can be cleared on-demand from the dashboard
+* **Uploadfs-Safe Settings & History Controls**: `/history/reset` endpoint plus UI button for purging stored history without touching configuration
+* **Shelly Push Subscriptions by Default**: Automatic `Shelly.Subscribe` session handling delivers NotifyStatus updates without polling
+* **Configurable Active Polling**: Toggle periodic `Shelly.GetStatus` via the configuration page – off by default to reduce network overhead
+* **Chronological Chart Inserts**: Real-time samples are buffered and inserted in timestamp order, preventing “time-travel” spikes
+* **Timestamp Source of Truth**: Shelly `ts`/`sys.unixtime` values drive all graphs, with UTC parsing in the browser for consistent results
+* **Improved Web Charts**: 24 h / 30 d charts use stacked bar visualization and stay in sync after browser refreshes
+* **Noise-Free Static Assets**: Removed source-map lookups and tightened LittleFS handlers to avoid repeated 404 logging
+
+### Highlights from Version 2.0-RC2
 * **NVS Configuration Storage**: Settings now survive filesystem (uploadfs) operations
 * **Physical Button Factory Reset**: Hold BOOT button for 5 seconds to reset device
 * **Configuration Backup/Restore**: Export and import settings via web interface
@@ -42,9 +52,9 @@ This device aims to assist homeowners in optimizing their use of renewable energ
 * **Chart Timestamp Validation**: Automatic cleanup of corrupted chart data
 * **Memory Optimization**: Reduced memory footprint with streaming JSON responses
 
-### ⚠️ Important: Upgrading to v2.0-RC2
+### ⚠️ Important: Upgrading to v2.0 (RC2+)
 
-**This version requires a one-time serial flash** due to partition table changes. After this initial flash, all future updates can be done via OTA.
+**The first 2.0 release required a one-time serial flash** due to partition table changes. After this initial flash, all future updates can be done via OTA. Historical 24 h/30 d aggregates are stored on LittleFS, so running `uploadfs` later will wipe those `.bin` files unless you back them up or let the device rebuild them.
 
 **Upgrade Steps:**
 1. **Backup your configuration** using the web interface (Settings → Download Config Backup)
@@ -126,6 +136,17 @@ Access the configuration page at `http://[device-ip]/config` to configure:
 * **System Actions**:
   * **Test LED Strip**: Verify LED strip is working correctly
   * **Factory Reset**: Clear all settings (also available via BOOT button - hold 5 seconds)
+  * **Clear Stored History**: Purge 1 h/24 h/30 d datasets (same as calling `/history/reset`)
+
+### Historical Data Persistence
+
+| Dataset | Resolution | Storage | Notes |
+|---------|------------|---------|-------|
+| Real-time buffer | 1 sample/second (~1 h) | RAM only | Lost on reboot/reset; repopulated live |
+| Last 24 Hours | 30-minute rolling averages | `/history/24h.bin` (LittleFS) | Reloaded at boot; cleared via UI or `uploadfs` unless backed up |
+| Last 30 Days | Daily rolling averages | `/history/30d.bin` (LittleFS) | Reloaded at boot; cleared via UI or `uploadfs` unless backed up |
+
+> Tip: If you plan to run `uploadfs`, copy the `.bin` files off the device first (or allow them to rebuild over time after the upload).
 
 ### Automatic Discovery
 The device automatically discovers Shelly devices on the network using mDNS. Supported devices:
@@ -306,7 +327,25 @@ This open-source project welcomes contributions to improve functionality and usa
 
 ## Version History
 
-### Version 2.0-RC2 (Current - Release Candidate)
+### Version 2.0-RC3 (Current - Release Candidate)
+**Major Changes:**
+- Persistent 24 h (30-minute) and 30 d (daily) aggregates with `/history/reset` control
+- Shelly push subscription lifecycle management plus optional active polling toggle
+- Chronological timestamp handling for both history reloads and live updates
+
+**New Features:**
+- Dashboard “Clear Stored History” button
+- Stacked bar charts for 24 h and 30 d views
+- Metrics `/data` responses include device/Shelly timestamps for consistent graphs
+- Noise-free static assets (no missing source-map requests)
+
+**Bug Fixes / Improvements:**
+- Prevented live chart “time travel” by buffering and inserting samples in order
+- Fixed history timestamps double-applying timezone offsets
+- Ensured Shelly websocket reconnects always resubscribe to NotifyStatus
+- Added ability to disable active polling to rely solely on push updates
+
+### Version 2.0-RC2
 **Major Changes:**
 - **NVS Configuration Storage**: Settings now persist across `uploadfs` operations
 - **Custom Partition Table**: Dedicated NVS partition for reliable storage
