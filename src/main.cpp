@@ -16,7 +16,9 @@
 #include <limits>
 #include <map>
 #include <vector>
+#include <cstdint>
 #include "includes.h"
+#include <cstring>
 #if defined(__GNUC__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
@@ -132,15 +134,49 @@ std::vector<ShellyDevice> shellyDevices;
 
 // Data history
 struct DataPoint {
-    uint64_t timestamp;  
+    uint32_t timestamp;  // Unix epoch seconds
     int grid;
     int solar;
     int consumer;
 };
 
-const int HISTORY_SIZE = 72; // 1.2 hours at 1-minute intervals (further reduced for ESP32-C3 memory constraints)
-DataPoint history[HISTORY_SIZE];
-int historyIndex = 0;
+const int SHORT_HISTORY_POINTS = 3600; // 1 hour @ 1-second resolution
+DataPoint shortHistory[SHORT_HISTORY_POINTS];
+int shortHistoryIndex = 0;
+bool shortHistoryFilled = false;
+uint32_t lastShortHistoryTimestamp = 0;
+
+struct AggregatedPoint {
+    uint32_t timestamp; // bucket start in epoch seconds
+    int grid;
+    int solar;
+    int consumer;
+};
+
+const int HISTORY_24H_BUCKETS = 48;   // 30-minute buckets over 24 hours
+const int HISTORY_30D_BUCKETS = 30;   // Daily buckets over 30 days
+const uint32_t HISTORY_24H_BUCKET_SECONDS = 1800;
+const uint32_t HISTORY_30D_BUCKET_SECONDS = 86400;
+
+AggregatedPoint history24h[HISTORY_24H_BUCKETS];
+int history24hIndex = 0;
+bool history24hFilled = false;
+
+AggregatedPoint history30d[HISTORY_30D_BUCKETS];
+int history30dIndex = 0;
+bool history30dFilled = false;
+
+struct BucketState {
+    uint32_t bucketDuration;
+    uint32_t bucketStart;
+    uint32_t sampleCount;
+    int64_t gridSum;
+    int64_t solarSum;
+    int64_t consumerSum;
+};
+
+BucketState bucket24h = {HISTORY_24H_BUCKET_SECONDS, 0, 0, 0, 0, 0};
+BucketState bucket30d = {HISTORY_30D_BUCKET_SECONDS, 0, 0, 0, 0, 0};
 
 // JsonDocument sizing to avoid heap fragmentation
 constexpr size_t JSON_CAPACITY_SMALL = 256;
@@ -161,6 +197,11 @@ const size_t LOG_FILE_SIZE_LIMIT = 50 * 1024; // 50 KB per log file
 const unsigned long METRICS_LOG_INTERVAL = 60000;
 const unsigned long LOW_MEMORY_LOG_INTERVAL = 300000;
 const size_t LOW_MEMORY_THRESHOLD = 45000;
+const char* HISTORY_DIRECTORY = "/history";
+const char* HISTORY_24H_FILE = "/history/24h.bin";
+const char* HISTORY_30D_FILE = "/history/30d.bin";
+const uint32_t HISTORY_FILE_MAGIC = 0x53485231;
+const uint16_t HISTORY_FILE_VERSION = 1;
 const int SHELLY_PING_FAILURE_THRESHOLD = 3;
 
 int shellyPingFailureCount = 0;
@@ -300,8 +341,10 @@ void checkAndEstablishWebSocket();
 bool isValidShellyHostname(const String& host);
 bool isValidShellyIP(const char* ip);
 void updateMeterActPower(int meterIndex, int newPower);
-void storeDataPoint();
+void storeDataPoint(uint32_t timestampEpoch);
 void handleHistory();
+void handleHistory24h();
+void handleHistory30d();
 void loadHistory();
 void setInitialTimeRange();
 void initializeLEDStrip();
@@ -318,6 +361,12 @@ void setupOTA();
 void handleOTA();
 bool ensureLittleFS();
 bool ensureLogDirectory();
+bool ensureHistoryDirectory();
+bool loadAggregatedHistory(const char* path, AggregatedPoint* buffer, int maxRecords, int &writeIndex, bool &filled);
+void persistAggregatedHistory(const char* path, AggregatedPoint* buffer, int maxRecords, int writeIndex, bool filled);
+void loadStoredHistories();
+String formatTimestampString(uint32_t epochSeconds);
+uint32_t extractShellyTimestamp(JsonObject root);
 void cleanupOldLogs();
 void trimLogFile(const String& path);
 String getLogFilePath();
@@ -610,6 +659,96 @@ void logSystemMetrics(bool force) {
              static_cast<int>(wsClient.available()),
              static_cast<unsigned int>(pendingRequests.size()));
     logSystemEvent("METRICS", String(buffer));
+}
+
+struct HistoryFileHeader {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t maxRecords;
+    uint16_t writeIndex;
+    uint8_t filled;
+    uint8_t reserved;
+};
+
+bool ensureHistoryDirectory() {
+    if (!ensureLittleFS()) {
+        return false;
+    }
+    if (!LittleFS.exists(HISTORY_DIRECTORY)) {
+        if (!LittleFS.mkdir(HISTORY_DIRECTORY)) {
+            TIMED_PRINTLN("Failed to create history directory.");
+            return false;
+        }
+    }
+    return true;
+}
+
+bool loadAggregatedHistory(const char* path, AggregatedPoint* buffer, int maxRecords, int &writeIndex, bool &filled) {
+    if (!ensureHistoryDirectory()) {
+        return false;
+    }
+    memset(buffer, 0, maxRecords * sizeof(AggregatedPoint));
+    writeIndex = 0;
+    filled = false;
+    if (!LittleFS.exists(path)) {
+        return false;
+    }
+    File file = LittleFS.open(path, "r");
+    if (!file) {
+        return false;
+    }
+    HistoryFileHeader header;
+    if (file.read(reinterpret_cast<uint8_t*>(&header), sizeof(header)) != sizeof(header)) {
+        file.close();
+        return false;
+    }
+    if (header.magic != HISTORY_FILE_MAGIC || header.version != HISTORY_FILE_VERSION || header.maxRecords != maxRecords) {
+        file.close();
+        TIMED_PRINTLN(String("History file header mismatch for ") + path);
+        return false;
+    }
+    size_t expectedSize = maxRecords * sizeof(AggregatedPoint);
+    size_t bytesRead = file.read(reinterpret_cast<uint8_t*>(buffer), expectedSize);
+    file.close();
+    if (bytesRead != expectedSize) {
+        TIMED_PRINTLN(String("History file size mismatch for ") + path);
+        return false;
+    }
+    writeIndex = header.writeIndex < maxRecords ? header.writeIndex : 0;
+    filled = header.filled == 1;
+    return true;
+}
+
+void persistAggregatedHistory(const char* path, AggregatedPoint* buffer, int maxRecords, int writeIndex, bool filled) {
+    if (!ensureHistoryDirectory()) {
+        return;
+    }
+    File file = LittleFS.open(path, "w");
+    if (!file) {
+        TIMED_PRINTLN(String("Failed to open history file for writing: ") + path);
+        return;
+    }
+    HistoryFileHeader header;
+    header.magic = HISTORY_FILE_MAGIC;
+    header.version = HISTORY_FILE_VERSION;
+    header.maxRecords = maxRecords;
+    header.writeIndex = writeIndex;
+    header.filled = filled ? 1 : 0;
+    header.reserved = 0;
+    
+    file.write(reinterpret_cast<uint8_t*>(&header), sizeof(header));
+    file.write(reinterpret_cast<uint8_t*>(buffer), maxRecords * sizeof(AggregatedPoint));
+    file.close();
+}
+
+void loadStoredHistories() {
+    if (!ensureHistoryDirectory()) {
+        return;
+    }
+    bool loaded24h = loadAggregatedHistory(HISTORY_24H_FILE, history24h, HISTORY_24H_BUCKETS, history24hIndex, history24hFilled);
+    bool loaded30d = loadAggregatedHistory(HISTORY_30D_FILE, history30d, HISTORY_30D_BUCKETS, history30dIndex, history30dFilled);
+    TIMED_PRINTLN(String("History 24h loaded: ") + (loaded24h ? "yes" : "no"));
+    TIMED_PRINTLN(String("History 30d loaded: ") + (loaded30d ? "yes" : "no"));
 }
 // Validation functions
 bool validateConfig() {
@@ -1815,83 +1954,105 @@ void handleConfig() {
     }
 }
 
-// History handling with streaming for large datasets
-void handleHistory() {
-    // Add headers for better performance and caching control
-    server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-    server.sendHeader("Pragma", "no-cache");
-    server.sendHeader("Expires", "0");
-    server.sendHeader("Access-Control-Allow-Origin", "*");
-    
-    // Check if client accepts gzip compression
-    String acceptEncoding = server.header("Accept-Encoding");
-    bool gzipSupported = acceptEncoding.indexOf("gzip") != -1;
-    
-    if (gzipSupported) {
-        server.sendHeader("Content-Encoding", "gzip");
-    }
-    
+void streamAggregatedHistory(AggregatedPoint* buffer, int maxRecords, int currentIndex, bool filled, uint32_t durationSeconds) {
     server.setContentLength(CONTENT_LENGTH_UNKNOWN);
     server.send(200, "application/json", "");
     server.sendContent("[");
     
     bool first = true;
-    int count = 0;
-    int index = historyIndex;
-    int validPoints = 0;
+    int total = filled ? maxRecords : currentIndex;
+    int startIndex = filled ? currentIndex : 0;
+    int processed = 0;
     
-    // First pass - count valid points for progress feedback
-    int tempIndex = historyIndex;
-    for (int i = 0; i < HISTORY_SIZE; i++) {
-        if (history[tempIndex].timestamp != 0) {
-            validPoints++;
-        }
-        tempIndex = (tempIndex + 1) % HISTORY_SIZE;
-    }
-    
-    TIMED_PRINTLN("Streaming " + String(validPoints) + " history points to client...");
-    
-    for (int i = 0; i < HISTORY_SIZE; i++) {
-        DataPoint &dp = history[index];
-        if (dp.timestamp == 0) {
-            index = (index + 1) % HISTORY_SIZE;
+    for (int i = 0; i < total; i++) {
+        int bufferIndex = (startIndex + i) % maxRecords;
+        AggregatedPoint &point = buffer[bufferIndex];
+        if (point.timestamp == 0) {
             continue;
         }
-
         if (!first) {
             server.sendContent(",");
         }
         first = false;
-
-        // Optimized timestamp format - use shorter format for better performance
-        time_t seconds = (time_t)(dp.timestamp / 1000);
-        int milliseconds = dp.timestamp % 1000;
-        struct tm *timeinfo = localtime(&seconds);
-        char timestampStr[20];
-        strftime(timestampStr, sizeof(timestampStr), "%Y%m%dT%H%M%S", timeinfo);
-        char fullTimestamp[24];
-        sprintf(fullTimestamp, "%s%03d", timestampStr, milliseconds);
-
-        // Use more compact JSON format
-        String objStr = "{\"timestamp\":\"" + String(fullTimestamp) + 
-                       "\",\"Grid\":" + String(dp.grid) + 
-                       ",\"Solar\":" + String(dp.solar) + 
-                       ",\"Consumer\":" + String(dp.consumer) + "}";
         
+        String timestampStr = formatTimestampString(point.timestamp);
+        String objStr = "{\"timestamp\":\"" + timestampStr +
+                       "\",\"duration\":" + String(durationSeconds) +
+                       ",\"Grid\":" + String(point.grid) +
+                       ",\"Solar\":" + String(point.solar) +
+                       ",\"Consumer\":" + String(point.consumer) + "}";
         server.sendContent(objStr);
-
-        index = (index + 1) % HISTORY_SIZE;
-        count++;
+        processed++;
         
-        // Less frequent watchdog resets for better performance
-        if (count % 20 == 0) {
-            esp_task_wdt_reset(); // Prevent watchdog timeout
-            yield(); // Allow other tasks to run
+        if (processed % 20 == 0) {
+            esp_task_wdt_reset();
+            yield();
         }
     }
     
     server.sendContent("]");
-    TIMED_PRINTLN("History streaming completed: " + String(count) + " points sent");
+}
+
+void sendHistoryHeaders() {
+    server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    server.sendHeader("Pragma", "no-cache");
+    server.sendHeader("Expires", "0");
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+}
+
+void handleHistory() {
+    sendHistoryHeaders();
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "application/json", "");
+    server.sendContent("[");
+    
+    bool first = true;
+    int total = shortHistoryFilled ? SHORT_HISTORY_POINTS : shortHistoryIndex;
+    int startIndex = shortHistoryFilled ? shortHistoryIndex : 0;
+    int processed = 0;
+    
+    TIMED_PRINTLN("Streaming " + String(total) + " short history points to client...");
+    
+    for (int i = 0; i < total; i++) {
+        int bufferIndex = (startIndex + i) % SHORT_HISTORY_POINTS;
+        DataPoint &dp = shortHistory[bufferIndex];
+        if (dp.timestamp == 0) {
+            continue;
+        }
+        
+        if (!first) {
+            server.sendContent(",");
+        }
+        first = false;
+        
+        String timestampStr = formatTimestampString(dp.timestamp);
+        String objStr = "{\"timestamp\":\"" + timestampStr +
+                       "\",\"Grid\":" + String(dp.grid) +
+                       ",\"Solar\":" + String(dp.solar) +
+                       ",\"Consumer\":" + String(dp.consumer) + "}";
+        server.sendContent(objStr);
+        processed++;
+        
+        if (processed % 50 == 0) {
+            esp_task_wdt_reset();
+            yield();
+        }
+    }
+    
+    server.sendContent("]");
+    TIMED_PRINTLN("Short history streaming completed: " + String(processed) + " points sent");
+}
+
+void handleHistory24h() {
+    sendHistoryHeaders();
+    streamAggregatedHistory(history24h, HISTORY_24H_BUCKETS, history24hIndex, history24hFilled, HISTORY_24H_BUCKET_SECONDS);
+    TIMED_PRINTLN("24h history served");
+}
+
+void handleHistory30d() {
+    sendHistoryHeaders();
+    streamAggregatedHistory(history30d, HISTORY_30D_BUCKETS, history30dIndex, history30dFilled, HISTORY_30D_BUCKET_SECONDS);
+    TIMED_PRINTLN("30d history served");
 }
 
 // Web server setup
@@ -1917,6 +2078,8 @@ void setupWebServer() {
     server.on("/data", handleJson);
     server.on("/config", handleConfig);
     server.on("/history", HTTP_GET, handleHistory);
+    server.on("/history/24h", HTTP_GET, handleHistory24h);
+    server.on("/history/30d", HTTP_GET, handleHistory30d);
     
     // Captive portal - catch all unknown requests
     server.onNotFound(handleCaptivePortal);
@@ -2006,17 +2169,24 @@ void setupWebServer() {
             meter["lastUpdate"] = meters[i].lastUpdateTime;
         }
         
-        // Add last few history points
+        // Add recent history points (for quick chart load)
         JsonArray historyArray = doc["recentHistory"].to<JsonArray>();
-        int startIdx = (historyIndex - 5 + HISTORY_SIZE) % HISTORY_SIZE;
-        for (int i = 0; i < 5; i++) {
-            int idx = (startIdx + i) % HISTORY_SIZE;
-            if (history[idx].timestamp != 0) {
+        int available = shortHistoryFilled ? SHORT_HISTORY_POINTS : shortHistoryIndex;
+        int sendCount = min(available, 60);
+        if (sendCount > 0) {
+            int start = shortHistoryFilled ? shortHistoryIndex : 0;
+            int begin = (start - sendCount + SHORT_HISTORY_POINTS) % SHORT_HISTORY_POINTS;
+            for (int i = 0; i < sendCount; i++) {
+                int idx = (begin + i) % SHORT_HISTORY_POINTS;
+                DataPoint &pointData = shortHistory[idx];
+                if (pointData.timestamp == 0) {
+                    continue;
+                }
                 JsonObject point = historyArray.add<JsonObject>();
-                point["timestamp"] = history[idx].timestamp;
-                point["grid"] = history[idx].grid;
-                point["solar"] = history[idx].solar;
-                point["consumer"] = history[idx].consumer;
+                point["timestamp"] = static_cast<uint64_t>(pointData.timestamp) * 1000ULL;
+                point["grid"] = pointData.grid;
+                point["solar"] = pointData.solar;
+                point["consumer"] = pointData.consumer;
             }
         }
         
@@ -2347,6 +2517,7 @@ void sendShellyGetStatus() {
         TIMED_PRINTLN("Shelly.GetStatus response received.");
         rpcInProgress = false;
 
+        uint32_t shellyTimestamp = extractShellyTimestamp(response);
         if (response["result"].is<JsonObject>()) {
             JsonObject result = response["result"];
             
@@ -2371,7 +2542,7 @@ void sendShellyGetStatus() {
                 TIMED_PRINTLN("Updated from monophase profile");
             }
             
-        storeDataPoint();
+        storeDataPoint(shellyTimestamp);
         }
     });
 }
@@ -2414,7 +2585,8 @@ void onMessageCallback(WebsocketsMessage message) {
                     }
                 }
             }
-            storeDataPoint();
+            uint32_t shellyTimestamp = extractShellyTimestamp(doc);
+            storeDataPoint(shellyTimestamp);
         }
     } else if (doc["id"].is<int>()) {
         int id = doc["id"];
@@ -2548,22 +2720,155 @@ void checkAndEstablishWebSocket() {
     }
 }
 
-// Data management
-void storeDataPoint() {
-    DataPoint &dp = history[historyIndex];
-    dp.timestamp = deviceStartTimeMillis + millis();
+void addToShortHistory(uint32_t timestampEpoch, int grid, int solar, int consumer) {
+    if (timestampEpoch == 0) {
+        return;
+    }
+    if (lastShortHistoryTimestamp != 0 && timestampEpoch < lastShortHistoryTimestamp) {
+        TIMED_PRINTLN("Skipping out-of-order short history sample");
+        return;
+    }
+    DataPoint &dp = shortHistory[shortHistoryIndex];
+    dp.timestamp = timestampEpoch;
+    dp.grid = grid;
+    dp.solar = solar;
+    dp.consumer = consumer;
+    
+    shortHistoryIndex = (shortHistoryIndex + 1) % SHORT_HISTORY_POINTS;
+    if (shortHistoryIndex == 0) {
+        shortHistoryFilled = true;
+    }
+    lastShortHistoryTimestamp = timestampEpoch;
+}
+
+void addAggregatedPoint(AggregatedPoint* historyBuffer, int maxRecords, int &writeIndex, bool &filled,
+                        const AggregatedPoint& point, const char* filePath) {
+    historyBuffer[writeIndex] = point;
+    writeIndex = (writeIndex + 1) % maxRecords;
+    if (writeIndex == 0) {
+        filled = true;
+    }
+    persistAggregatedHistory(filePath, historyBuffer, maxRecords, writeIndex, filled);
+}
+
+void finalizeBucket(BucketState& state, AggregatedPoint* historyBuffer, int maxRecords, int &writeIndex,
+                    bool &filled, const char* filePath) {
+    if (state.sampleCount == 0 || state.bucketStart == 0) {
+        state.gridSum = 0;
+        state.solarSum = 0;
+        state.consumerSum = 0;
+        state.sampleCount = 0;
+        return;
+    }
+    AggregatedPoint point;
+    point.timestamp = state.bucketStart;
+    point.grid = static_cast<int>(state.gridSum / static_cast<int32_t>(state.sampleCount));
+    point.solar = static_cast<int>(state.solarSum / static_cast<int32_t>(state.sampleCount));
+    point.consumer = static_cast<int>(state.consumerSum / static_cast<int32_t>(state.sampleCount));
+    
+    addAggregatedPoint(historyBuffer, maxRecords, writeIndex, filled, point, filePath);
+    
+    state.gridSum = 0;
+    state.solarSum = 0;
+    state.consumerSum = 0;
+    state.sampleCount = 0;
+}
+
+void processAggregationSample(BucketState& state, uint32_t timestampEpoch, int grid, int solar, int consumer,
+                              AggregatedPoint* historyBuffer, int maxRecords, int &writeIndex,
+                              bool &filled, const char* filePath) {
+    if (timestampEpoch == 0) {
+        return;
+    }
+    uint32_t bucketStartAligned = (timestampEpoch / state.bucketDuration) * state.bucketDuration;
+    if (state.bucketStart == 0) {
+        state.bucketStart = bucketStartAligned;
+    }
+    if (bucketStartAligned > state.bucketStart) {
+        if (state.sampleCount > 0) {
+            finalizeBucket(state, historyBuffer, maxRecords, writeIndex, filled, filePath);
+        }
+        state.bucketStart = bucketStartAligned;
+    } else if (bucketStartAligned < state.bucketStart) {
+        // Ignore out-of-order samples for aggregated history
+        return;
+    }
+    
+    state.gridSum += grid;
+    state.solarSum += solar;
+    state.consumerSum += consumer;
+    state.sampleCount++;
+}
+
+void storeDataPoint(uint32_t timestampEpoch) {
+    if (timestampEpoch == 0) {
+        timestampEpoch = timeInitialized ? myTZ.now() : (millis() / 1000UL);
+    }
+    
+    int gridVal = 0;
+    int solarVal = 0;
+    int consumerVal = 0;
     
     for (int i = 0; i < 3; i++) {
         if (meters[i].name.equalsIgnoreCase("Grid")) {
-            dp.grid = meters[i].act_power;
+            gridVal = meters[i].act_power;
         } else if (meters[i].name.equalsIgnoreCase("Solar")) {
-            dp.solar = meters[i].act_power;
+            solarVal = meters[i].act_power;
         } else if (meters[i].name.equalsIgnoreCase("Consumer")) {
-            dp.consumer = meters[i].act_power;
+            consumerVal = meters[i].act_power;
         }
     }
     
-    historyIndex = (historyIndex + 1) % HISTORY_SIZE;
+    addToShortHistory(timestampEpoch, gridVal, solarVal, consumerVal);
+    processAggregationSample(bucket24h, timestampEpoch, gridVal, solarVal, consumerVal,
+                             history24h, HISTORY_24H_BUCKETS, history24hIndex, history24hFilled, HISTORY_24H_FILE);
+    processAggregationSample(bucket30d, timestampEpoch, gridVal, solarVal, consumerVal,
+                             history30d, HISTORY_30D_BUCKETS, history30dIndex, history30dFilled, HISTORY_30D_FILE);
+}
+
+String formatTimestampString(uint32_t epochSeconds) {
+    if (epochSeconds == 0) {
+        return "19700101T000000000";
+    }
+    time_t rawTime = static_cast<time_t>(epochSeconds);
+    struct tm timeinfo;
+    gmtime_r(&rawTime, &timeinfo);
+    char timestampStr[20];
+    strftime(timestampStr, sizeof(timestampStr), "%Y%m%dT%H%M%S", &timeinfo);
+    char fullTimestamp[24];
+    snprintf(fullTimestamp, sizeof(fullTimestamp), "%s000", timestampStr);
+    return String(fullTimestamp);
+}
+
+uint32_t extractShellyTimestamp(JsonObject root) {
+    if (root["ts"].is<uint32_t>()) {
+        return root["ts"].as<uint32_t>();
+    }
+    if (root["params"].is<JsonObject>()) {
+        JsonObject params = root["params"];
+        if (params["ts"].is<uint32_t>()) {
+            return params["ts"].as<uint32_t>();
+        }
+        if (params["sys"].is<JsonObject>() && params["sys"]["unixtime"].is<uint32_t>()) {
+            return params["sys"]["unixtime"].as<uint32_t>();
+        }
+    }
+    if (root["result"].is<JsonObject>()) {
+        JsonObject result = root["result"];
+        if (result["ts"].is<uint32_t>()) {
+            return result["ts"].as<uint32_t>();
+        }
+        if (result["sys"].is<JsonObject>() && result["sys"]["unixtime"].is<uint32_t>()) {
+            return result["sys"]["unixtime"].as<uint32_t>();
+        }
+    }
+    if (root["sys"].is<JsonObject>() && root["sys"]["unixtime"].is<uint32_t>()) {
+        return root["sys"]["unixtime"].as<uint32_t>();
+    }
+    if (timeInitialized) {
+        return myTZ.now();
+    }
+    return millis() / 1000UL;
 }
 
 void updateEnergyMeterData() {
@@ -2751,6 +3056,7 @@ void setup() {
     
     // Initialize LED strip with loaded configuration
     initializeLEDStrip();
+    loadStoredHistories();
 
     // Check if we have valid WiFi credentials
     bool hasValidCredentials = (strlen(ssid) > 0 && strlen(ssid) < 32);

@@ -255,6 +255,10 @@
       margin-bottom: 20px;
     }
     
+    .chart-container.compact {
+      height: 360px;
+    }
+    
     .chart-title {
       font-size: 1.5em;
       font-weight: 600;
@@ -332,6 +336,16 @@
         <div class="chart-title">Power Consumption Over Time</div>
         <canvas id="energyChart"></canvas>
       </div>
+
+      <div class="chart-container compact">
+        <div class="chart-title">Last 24 Hours (30 min averages)</div>
+        <canvas id="chart24h"></canvas>
+      </div>
+
+      <div class="chart-container compact">
+        <div class="chart-title">Last 30 Days (Daily averages)</div>
+        <canvas id="chart30d"></canvas>
+      </div>
       
       <!-- Uptime Display in Bottom Left -->
       <div id="uptimeValue" style="
@@ -365,7 +379,7 @@
     </div>
 
   <script>
-    var energyChart;
+    var energyChart, energyChart24h, energyChart30d;
     var frequencySlider = document.getElementById('frequencySlider');
     var frequencyValueDisplay = document.getElementById('frequencyValue');
     var fetchIntervalID;
@@ -501,6 +515,63 @@
             pan: { enabled: true, mode: 'x' }
           }
         }
+      }
+    });
+
+    const ctx24h = document.getElementById('chart24h').getContext('2d');
+    energyChart24h = new Chart(ctx24h, {
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [
+          { label: 'Grid', data: [], borderColor: '#e67e22', backgroundColor: 'rgba(230, 126, 34, 0.15)', fill: true },
+          { label: 'Solar', data: [], borderColor: '#2ecc71', backgroundColor: 'rgba(46, 204, 113, 0.15)', fill: true },
+          { label: 'Consumer', data: [], borderColor: '#1abc9c', backgroundColor: 'rgba(26, 188, 156, 0.15)', fill: true }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { intersect: false, mode: 'index' },
+        scales: {
+          x: {
+            type: 'time',
+            time: { parser: 'YYYYMMDDTHHmmssSSS', unit: 'hour', displayFormats: { hour: 'MMM D HH:mm' } },
+            title: { display: true, text: 'Time' }
+          },
+          y: { title: { display: true, text: 'Power (W)' }, beginAtZero: true }
+        },
+        plugins: { legend: { position: 'bottom' } }
+      }
+    });
+
+    const ctx30d = document.getElementById('chart30d').getContext('2d');
+    energyChart30d = new Chart(ctx30d, {
+      type: 'bar',
+      data: {
+        labels: [],
+        datasets: [
+          { label: 'Grid', data: [], backgroundColor: 'rgba(231, 76, 60, 0.6)' },
+          { label: 'Solar', data: [], backgroundColor: 'rgba(39, 174, 96, 0.6)' },
+          { label: 'Consumer', data: [], backgroundColor: 'rgba(52, 152, 219, 0.6)' }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        scales: {
+          x: {
+            stacked: true,
+            type: 'time',
+            time: { parser: 'YYYYMMDDTHHmmssSSS', unit: 'day', displayFormats: { day: 'MMM D' } },
+            title: { display: true, text: 'Date' }
+          },
+          y: {
+            stacked: true,
+            title: { display: true, text: 'Power (W)' }
+          }
+        },
+        plugins: { legend: { position: 'bottom' } }
       }
     });
 
@@ -719,6 +790,48 @@
             loadHistory();
           }, 10000);
         });
+    }
+
+    function updateTrendChart(chart, data) {
+      if (!chart) return;
+      chart.data.labels = [];
+      chart.data.datasets.forEach(ds => ds.data = []);
+      data.forEach(point => {
+        const timeLabel = moment(point.timestamp, "YYYYMMDDTHHmmssSSS").toDate();
+        chart.data.labels.push(timeLabel);
+        chart.data.datasets[0].data.push(point.Grid);
+        chart.data.datasets[1].data.push(point.Solar);
+        chart.data.datasets[2].data.push(point.Consumer);
+      });
+      chart.update('none');
+    }
+
+    function loadHistory24h() {
+      console.log("Loading 24h aggregates...");
+      fetch('/history/24h', { cache: 'no-cache' })
+        .then(response => {
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          return response.json();
+        })
+        .then(data => {
+          data.sort((a, b) => moment(a.timestamp, "YYYYMMDDTHHmmssSSS").valueOf() - moment(b.timestamp, "YYYYMMDDTHHmmssSSS").valueOf());
+          updateTrendChart(energyChart24h, data);
+        })
+        .catch(error => console.error("24h history load failed:", error));
+    }
+
+    function loadHistory30d() {
+      console.log("Loading 30d aggregates...");
+      fetch('/history/30d', { cache: 'no-cache' })
+        .then(response => {
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          return response.json();
+        })
+        .then(data => {
+          data.sort((a, b) => moment(a.timestamp, "YYYYMMDDTHHmmssSSS").valueOf() - moment(b.timestamp, "YYYYMMDDTHHmmssSSS").valueOf());
+          updateTrendChart(energyChart30d, data);
+        })
+        .catch(error => console.error("30d history load failed:", error));
     }
 
     // Use lightweight endpoint for frequent updates
@@ -994,12 +1107,16 @@
       // Progressive loading for better performance
       setTimeout(() => {
         loadHistoryQuick();  // Quick load first for immediate feedback
+        loadHistory24h();
+        loadHistory30d();
         fetchData();         // Get current data with time/uptime info
       }, 300);
       
       // Set up intervals - lightweight updates frequently, full updates less often
       fetchIntervalID = setInterval(fetchDataLight, 2000); // Lightweight every 2 seconds
       setInterval(fetchData, 10000); // Full data every 10 seconds for uptime/time
+      setInterval(loadHistory24h, 5 * 60 * 1000);  // Refresh 24h chart every 5 minutes
+      setInterval(loadHistory30d, 30 * 60 * 1000); // Refresh 30d chart every 30 minutes
     }
     
     window.onload = function() {
