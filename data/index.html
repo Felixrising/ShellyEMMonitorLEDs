@@ -538,7 +538,7 @@
               tooltipFormat: 'YYYY-MM-DD HH:mm:ss'
             },
             title: { display: true, text: 'Time' },
-            bounds: 'ticks',
+            bounds: 'data',
             adapters: {
               date: {}
             }
@@ -938,26 +938,23 @@
       
       // Auto-adjust x-axis to show latest data unless user has manually zoomed/panned
       if (!userHasInteracted && labels.length > 0) {
-        const xScale = energyChart.scales.x;
         const latestTime = labels[labels.length - 1].getTime();
         const now = Date.now();
         const oneHourAgo = now - (60 * 60 * 1000);
         
-        // Only auto-adjust if the latest point is recent (within last hour)
+        // Always auto-adjust to show last hour when new data arrives
         if (latestTime > oneHourAgo) {
-          const currentMax = xScale.max;
-          const fiveMinutesAgo = now - (5 * 60 * 1000);
+          // Set scale to show last hour, with latest data visible
+          const minTime = Math.max(oneHourAgo, latestTime - (60 * 60 * 1000));
+          const maxTime = latestTime + (60 * 1000); // Show 1 minute into future
           
-          // If the scale max is more than 5 minutes behind current time, auto-adjust
-          if (!currentMax || currentMax < fiveMinutesAgo) {
-            // Set scale to show last hour, with latest data visible
-            const minTime = Math.max(oneHourAgo, latestTime - (60 * 60 * 1000));
-            const maxTime = latestTime + (60 * 1000); // Show 1 minute into future
-            
-            // Update scale limits directly
-            xScale.min = minTime;
-            xScale.max = maxTime;
-          }
+          // Update scale limits through chart options (proper way for Chart.js)
+          energyChart.options.scales.x.min = minTime;
+          energyChart.options.scales.x.max = maxTime;
+        } else {
+          // If data is older than 1 hour, let chart auto-scale
+          energyChart.options.scales.x.min = undefined;
+          energyChart.options.scales.x.max = undefined;
         }
       }
       
