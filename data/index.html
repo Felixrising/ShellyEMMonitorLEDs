@@ -397,7 +397,7 @@
         color: white;
         backdrop-filter: blur(5px);
       ">Connected</div>
-      
+
     </div>
 
   <script>
@@ -409,6 +409,8 @@
     // Connection management
     let connectionFailures = 0;
     let lastSuccessfulFetch = Date.now();
+    let consecutiveFailures = 0;
+    const MAX_CONSECUTIVE_FAILURES = 3; // Require 3 consecutive failures before showing error
     
     // Timestamp validation helper
     function isValidTimestamp(timestamp) {
@@ -446,26 +448,37 @@
       const statusEl = document.getElementById('connectionStatus');
       if (status === 'connected') {
         statusEl.style.background = '#28a745';
+        statusEl.style.color = 'white';
         statusEl.innerText = 'Connected';
         connectionFailures = 0;
+        consecutiveFailures = 0;
         lastSuccessfulFetch = Date.now();
       } else if (status === 'warning') {
         statusEl.style.background = '#ffc107';
         statusEl.style.color = '#856404';
         statusEl.innerText = message || 'Slow Connection';
       } else {
-        statusEl.style.background = '#dc3545';
-        statusEl.style.color = 'white';
-        statusEl.innerText = message || 'Connection Error';
-        connectionFailures++;
+        consecutiveFailures++;
+        // Only show error after multiple consecutive failures
+        if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+          statusEl.style.background = '#dc3545';
+          statusEl.style.color = 'white';
+          statusEl.innerText = message || 'Connection Error';
+          connectionFailures++;
+        } else {
+          // Show warning for occasional failures
+          statusEl.style.background = '#ffc107';
+          statusEl.style.color = '#856404';
+          statusEl.innerText = 'Connecting...';
+        }
       }
     }
     
     function checkConnectionHealth() {
       const timeSinceLastSuccess = Date.now() - lastSuccessfulFetch;
-      if (timeSinceLastSuccess > 15000) { // 15 seconds
+      if (timeSinceLastSuccess > 30000) { // 30 seconds - more lenient
         updateConnectionStatus('error', 'Connection Lost');
-      } else if (timeSinceLastSuccess > 8000) { // 8 seconds
+      } else if (timeSinceLastSuccess > 15000) { // 15 seconds
         updateConnectionStatus('warning', 'Connection Slow');
       }
     }
@@ -524,7 +537,11 @@
               displayFormats: { minute: 'HH:mm:ss' },
               tooltipFormat: 'YYYY-MM-DD HH:mm:ss'
             },
-            title: { display: true, text: 'Time' }
+            title: { display: true, text: 'Time' },
+            bounds: 'ticks',
+            adapters: {
+              date: {}
+            }
           },
           y: {
             title: { display: true, text: 'Power (W)' },
@@ -533,8 +550,21 @@
         },
         plugins: {
           zoom: {
-            zoom: { wheel: { enabled: true }, pinch: { enabled: true }, mode: 'x' },
-            pan: { enabled: true, mode: 'x' }
+            zoom: { 
+              wheel: { enabled: true }, 
+              pinch: { enabled: true }, 
+              mode: 'x',
+              onZoomComplete: function() {
+                userHasInteracted = true;
+              }
+            },
+            pan: { 
+              enabled: true, 
+              mode: 'x',
+              onPanComplete: function() {
+                userHasInteracted = true;
+              }
+            }
           }
         }
       }
@@ -542,13 +572,13 @@
 
     const ctx24h = document.getElementById('chart24h').getContext('2d');
     energyChart24h = new Chart(ctx24h, {
-      type: 'bar',
+      type: 'line',
       data: {
         labels: [],
         datasets: [
-          { label: 'Grid', data: [], backgroundColor: 'rgba(230, 126, 34, 0.7)', borderRadius: 4 },
-          { label: 'Solar', data: [], backgroundColor: 'rgba(46, 204, 113, 0.7)', borderRadius: 4 },
-          { label: 'Consumer', data: [], backgroundColor: 'rgba(26, 188, 156, 0.7)', borderRadius: 4 }
+          { label: 'Grid', data: [], borderColor: 'rgba(230, 126, 34, 1)', backgroundColor: 'rgba(230, 126, 34, 0.15)', fill: false, tension: 0.15 },
+          { label: 'Solar', data: [], borderColor: 'rgba(46, 204, 113, 1)', backgroundColor: 'rgba(46, 204, 113, 0.15)', fill: false, tension: 0.15 },
+          { label: 'Consumer', data: [], borderColor: 'rgba(26, 188, 156, 1)', backgroundColor: 'rgba(26, 188, 156, 0.15)', fill: false, tension: 0.15 }
         ]
       },
       options: {
@@ -557,49 +587,46 @@
         interaction: { intersect: false, mode: 'index' },
         scales: {
           x: {
-            stacked: true,
             type: 'time',
             time: { parser: 'YYYYMMDDTHHmmssSSS', unit: 'hour', displayFormats: { hour: 'MMM D HH:mm' } },
             title: { display: true, text: 'Time' }
           },
           y: {
-            stacked: true,
             title: { display: true, text: 'Power (W)' },
             beginAtZero: true
           }
         },
-        plugins: { legend: { position: 'bottom' } }
+        plugins: { legend: { position: 'top' } }
       }
     });
 
     const ctx30d = document.getElementById('chart30d').getContext('2d');
     energyChart30d = new Chart(ctx30d, {
-      type: 'bar',
+      type: 'line',
       data: {
         labels: [],
         datasets: [
-          { label: 'Grid', data: [], backgroundColor: 'rgba(231, 76, 60, 0.7)', borderRadius: 4 },
-          { label: 'Solar', data: [], backgroundColor: 'rgba(39, 174, 96, 0.7)', borderRadius: 4 },
-          { label: 'Consumer', data: [], backgroundColor: 'rgba(52, 152, 219, 0.7)', borderRadius: 4 }
+          { label: 'Grid', data: [], borderColor: 'rgba(231, 76, 60, 1)', backgroundColor: 'rgba(231, 76, 60, 0.15)', fill: false, tension: 0.15 },
+          { label: 'Solar', data: [], borderColor: 'rgba(39, 174, 96, 1)', backgroundColor: 'rgba(39, 174, 96, 0.15)', fill: false, tension: 0.15 },
+          { label: 'Consumer', data: [], borderColor: 'rgba(52, 152, 219, 1)', backgroundColor: 'rgba(52, 152, 219, 0.15)', fill: false, tension: 0.15 }
         ]
       },
       options: {
         responsive: true,
         maintainAspectRatio: false,
+        interaction: { intersect: false, mode: 'index' },
         scales: {
           x: {
-            stacked: true,
             type: 'time',
             time: { parser: 'YYYYMMDDTHHmmssSSS', unit: 'day', displayFormats: { day: 'MMM D' } },
             title: { display: true, text: 'Date' }
           },
           y: {
-            stacked: true,
             title: { display: true, text: 'Power (W)' },
             beginAtZero: true
           }
         },
-        plugins: { legend: { position: 'bottom' } }
+        plugins: { legend: { position: 'top' } }
       }
     });
 
@@ -784,6 +811,9 @@
 
           // Clean any invalid data before updating
           cleanChartData();
+
+          // Reset user interaction flag when history is reloaded
+          userHasInteracted = false;
           
           energyChart.update('none'); // Use 'none' animation for better performance
           console.log("Full history loaded, sorted, and chart updated.");
@@ -862,6 +892,14 @@
         .catch(error => console.error("30d history load failed:", error));
     }
 
+    // Track if user has manually zoomed/panned the chart
+    let userHasInteracted = false;
+    
+    // Listen for zoom/pan events to track user interaction
+    if (typeof Chart !== 'undefined' && Chart.registry) {
+      // This will be set up after chart initialization
+    }
+
     function addRealtimePoint(timeLabel, gridPower, solarPower, consumerPower, animationMode = 'none') {
       if (!energyChart) return;
       const labels = energyChart.data.labels;
@@ -897,6 +935,32 @@
       }
 
       cleanChartData();
+      
+      // Auto-adjust x-axis to show latest data unless user has manually zoomed/panned
+      if (!userHasInteracted && labels.length > 0) {
+        const xScale = energyChart.scales.x;
+        const latestTime = labels[labels.length - 1].getTime();
+        const now = Date.now();
+        const oneHourAgo = now - (60 * 60 * 1000);
+        
+        // Only auto-adjust if the latest point is recent (within last hour)
+        if (latestTime > oneHourAgo) {
+          const currentMax = xScale.max;
+          const fiveMinutesAgo = now - (5 * 60 * 1000);
+          
+          // If the scale max is more than 5 minutes behind current time, auto-adjust
+          if (!currentMax || currentMax < fiveMinutesAgo) {
+            // Set scale to show last hour, with latest data visible
+            const minTime = Math.max(oneHourAgo, latestTime - (60 * 60 * 1000));
+            const maxTime = latestTime + (60 * 1000); // Show 1 minute into future
+            
+            // Update scale limits directly
+            xScale.min = minTime;
+            xScale.max = maxTime;
+          }
+        }
+      }
+      
       energyChart.update(animationMode);
     }
     
@@ -944,7 +1008,7 @@
       const controller = new AbortController();
       const timeoutId = setTimeout(() => {
         controller.abort();
-      }, 3000); // 3 second timeout for lightweight requests
+      }, 8000); // 8 second timeout for lightweight requests (increased from 3s)
       
       fetch('/metrics', { 
         signal: controller.signal,
@@ -992,9 +1056,20 @@
         })
                  .catch(error => {
             clearTimeout(timeoutId);
-            updateConnectionStatus('error', 'Fetch Failed');
-            // Fallback to full data fetch
-            fetchData();
+            // Don't immediately mark as error - let consecutive failure tracking handle it
+            if (error.name === 'AbortError') {
+              console.warn("Lightweight fetch timed out, will retry");
+            } else {
+              console.warn("Lightweight fetch failed:", error.message);
+            }
+            // Only update status if we have multiple consecutive failures
+            if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES - 1) {
+              updateConnectionStatus('error', 'Fetch Failed');
+            }
+            // Fallback to full data fetch (but don't spam it)
+            if (consecutiveFailures < 2) {
+              setTimeout(() => fetchData(), 2000); // Delay fallback to avoid spam
+            }
          });
     }
 
@@ -1006,8 +1081,8 @@
       const controller = new AbortController();
       const timeoutId = setTimeout(() => {
         controller.abort();
-        console.warn("Data fetch timed out after 5 seconds");
-      }, 5000); // 5 second timeout for real-time data
+        console.warn("Data fetch timed out after 10 seconds");
+      }, 10000); // 10 second timeout for real-time data (increased from 5s)
       
       fetch('/data', { 
         signal: controller.signal,
@@ -1095,9 +1170,18 @@
         })
         .catch(error => {
            clearTimeout(timeoutId);
-           updateConnectionStatus('error', error.name === 'AbortError' ? 'Timeout' : 'Error');
-           console.error("Error fetching data:", error);
-           console.error("Fetch duration before error:", Date.now() - fetchStartTime, "ms");
+           // Handle timeout/errors more gracefully
+           if (error.name === 'AbortError') {
+             console.warn("Data fetch timed out after", Date.now() - fetchStartTime, "ms");
+             // Timeout is handled by consecutive failure tracking
+           } else {
+             console.error("Error fetching data:", error);
+             console.error("Fetch duration before error:", Date.now() - fetchStartTime, "ms");
+           }
+           // Only update status if we have multiple consecutive failures
+           if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES - 1) {
+             updateConnectionStatus('error', error.name === 'AbortError' ? 'Timeout' : 'Error');
+           }
            
            // Show user-friendly error message for data fetch issues
            const uptimeElement = document.getElementById('uptimeValue');
