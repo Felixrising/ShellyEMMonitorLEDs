@@ -234,6 +234,18 @@ struct PendingRequest {
 std::map<int, PendingRequest> pendingRequests;
 int commandId = 0;
 
+// JSON Console buffer for debugging
+struct ConsoleEntry {
+    unsigned long timestamp;  // milliseconds since boot
+    String jsonData;
+    bool isValid;
+};
+
+const int CONSOLE_BUFFER_SIZE = 50;  // Store last 50 messages
+ConsoleEntry consoleBuffer[CONSOLE_BUFFER_SIZE];
+int consoleBufferIndex = 0;
+bool consoleBufferFilled = false;
+
 // LED configuration variables
 int LED_COUNT_var = 60;
 int LED_PIN_var = 4;
@@ -898,9 +910,9 @@ void monitorNetworkHealth() {
                 shellyPingFailureCount++;
                 TIMED_PRINTLN("Shelly device ping failed (" + String(shellyPingFailureCount) + "/" + String(SHELLY_PING_FAILURE_THRESHOLD) + ")");
                 if (shellyPingFailureCount >= SHELLY_PING_FAILURE_THRESHOLD) {
-                    TIMED_PRINTLN("Shelly device unreachable, triggering rediscovery");
+                TIMED_PRINTLN("Shelly device unreachable, triggering rediscovery");
                     logSystemEvent("WARN", "Shelly unreachable at " + String(shellyIP) + " after " + String(shellyPingFailureCount) + " failed checks");
-                    wsClient.close();
+                wsClient.close();
                     shellyRediscoveryNeeded = true;
                     shellyPingFailureCount = 0;
                     lastWebSocketAttempt = 0; // allow immediate reconnect attempt
@@ -1333,10 +1345,10 @@ void handleWiFiScan() {
         doc["message"] = "No networks found";
         doc["count"] = 0;
     } else {
-        TIMED_PRINTLN("WiFi scan found " + String(n) + " networks");
+    TIMED_PRINTLN("WiFi scan found " + String(n) + " networks");
         doc["count"] = n;
-        
-        for (int i = 0; i < n && i < 20; i++) { // Limit to 20 networks
+    
+    for (int i = 0; i < n && i < 20; i++) { // Limit to 20 networks
             String ssid = WiFi.SSID(i);
             int rssi = WiFi.RSSI(i);
             
@@ -1345,10 +1357,10 @@ void handleWiFiScan() {
                 ssid = "[Hidden Network]";
             }
             
-            JsonObject network = networks.add<JsonObject>();
+        JsonObject network = networks.add<JsonObject>();
             network["ssid"] = ssid;
             network["rssi"] = rssi;
-            network["secure"] = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
+        network["secure"] = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
             
             // Debug output
             TIMED_PRINTLN("  [" + String(i) + "] " + ssid + " (RSSI: " + String(rssi) + "dBm)");
@@ -1565,19 +1577,19 @@ bool loadConfigNVS() {
         preferences.end();
         
         currentLEDTypeIndex = findLEDTypeIndex(LED_TYPE_flags);
-        validateConfig();
-        
+    validateConfig();
+
         TIMED_PRINTLN("Configuration loaded from NVS:");
-        TIMED_PRINTLN("SSID: " + String(ssid));
-        TIMED_PRINTLN("Shelly IP: " + String(shellyIP));
-        TIMED_PRINTLN("SheMeter Name: " + ShemeterName);
-        TIMED_PRINTLN("Timezone: " + getTimezoneDisplayName(timezone) + " (" + String(timezone) + ")");
-        TIMED_PRINTLN("LED Count: " + String(LED_COUNT_var));
-        TIMED_PRINTLN("LED Pin: " + String(LED_PIN_var));
-        TIMED_PRINTLN("LED Type: " + getLEDTypeName(LED_TYPE_flags) + " (0x" + String(LED_TYPE_flags, HEX) + ")");
-        TIMED_PRINTLN("LED Strip Inverted: " + String(invertStrip ? "Yes" : "No"));
-        
-        return true;
+    TIMED_PRINTLN("SSID: " + String(ssid));
+    TIMED_PRINTLN("Shelly IP: " + String(shellyIP));
+    TIMED_PRINTLN("SheMeter Name: " + ShemeterName);
+    TIMED_PRINTLN("Timezone: " + getTimezoneDisplayName(timezone) + " (" + String(timezone) + ")");
+    TIMED_PRINTLN("LED Count: " + String(LED_COUNT_var));
+    TIMED_PRINTLN("LED Pin: " + String(LED_PIN_var));
+    TIMED_PRINTLN("LED Type: " + getLEDTypeName(LED_TYPE_flags) + " (0x" + String(LED_TYPE_flags, HEX) + ")");
+    TIMED_PRINTLN("LED Strip Inverted: " + String(invertStrip ? "Yes" : "No"));
+    
+    return true;
     } else {
         TIMED_PRINTLN("No configuration found in NVS");
         preferences.end();
@@ -1615,8 +1627,8 @@ bool saveConfigNVS() {
     
     TIMED_PRINTLN("Configuration saved to NVS (uploadfs-safe storage)");
     return true;
-}
-
+    }
+    
 void loadDefaultConfig() {
     strncpy(ssid, defaultSSID, sizeof(ssid) - 1);
     ssid[sizeof(ssid) - 1] = '\0';
@@ -1915,6 +1927,24 @@ void handleConfig() {
         html += "<div id='configStatus' style='margin-top: 10px; font-size: 0.9em;'></div>";
         html += "</div>";
         
+        // JSON Console View
+        html += "<div class='card'>";
+        html += "<div class='section-title'>JSON Console</div>";
+        html += "<div style='margin-bottom: 15px; padding: 10px; background: #e8f4f8; border-left: 4px solid #2196F3; font-size: 0.9em;'>";
+        html += "<strong>📡 Console View:</strong> View incoming JSON messages from the Shelly device with timestamps. Useful for debugging and monitoring data flow.";
+        html += "</div>";
+        html += "<button type='button' class='btn btn-secondary' onclick='toggleConsole()' id='consoleToggleBtn'>Show Console</button>";
+        html += "<button type='button' class='btn btn-secondary' onclick='clearConsole()' id='clearConsoleBtn' style='display:none;'>Clear Console</button>";
+        html += "<div id='consoleContainer' style='display:none; margin-top: 20px;'>";
+        html += "<div style='background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 8px; font-family: \"Courier New\", monospace; font-size: 12px; max-height: 500px; overflow-y: auto;'>";
+        html += "<div id='consoleContent'>Loading console data...</div>";
+        html += "</div>";
+        html += "<div style='margin-top: 10px; font-size: 0.9em; color: #666;'>";
+        html += "<span id='consoleStatus'>Click 'Show Console' to view incoming JSON messages</span>";
+        html += "</div>";
+        html += "</div>";
+        html += "</div>";
+        
         // System Actions
         html += "<div class='card'>";
         html += "<div class='section-title'>System Actions</div>";
@@ -1970,6 +2000,74 @@ void handleConfig() {
         html += "    console.error('Debug data fetch error:', error);";
         html += "    alert('Debug data fetch failed. Check console for details.');";
         html += "  });";
+        html += "}";
+        html += "let consoleUpdateInterval = null;";
+        html += "function toggleConsole() {";
+        html += "  const container = document.getElementById('consoleContainer');";
+        html += "  const btn = document.getElementById('consoleToggleBtn');";
+        html += "  const clearBtn = document.getElementById('clearConsoleBtn');";
+        html += "  if (container.style.display === 'none') {";
+        html += "    container.style.display = 'block';";
+        html += "    btn.textContent = 'Hide Console';";
+        html += "    clearBtn.style.display = 'inline-block';";
+        html += "    loadConsole();";
+        html += "    consoleUpdateInterval = setInterval(loadConsole, 2000);";
+        html += "  } else {";
+        html += "    container.style.display = 'none';";
+        html += "    btn.textContent = 'Show Console';";
+        html += "    clearBtn.style.display = 'none';";
+        html += "    if (consoleUpdateInterval) {";
+        html += "      clearInterval(consoleUpdateInterval);";
+        html += "      consoleUpdateInterval = null;";
+        html += "    }";
+        html += "  }";
+        html += "}";
+        html += "function loadConsole() {";
+        html += "  fetch('/console')";
+        html += "    .then(response => response.json())";
+        html += "    .then(data => {";
+        html += "      const content = document.getElementById('consoleContent');";
+        html += "      const status = document.getElementById('consoleStatus');";
+        html += "      if (data.entries && data.entries.length > 0) {";
+        html += "        let html = '';";
+        html += "        data.entries.forEach((entry, idx) => {";
+        html += "          const date = new Date(data.currentTime - entry.ageMs);";
+        html += "          const timeStr = date.toLocaleTimeString() + '.' + String(date.getMilliseconds()).padStart(3, '0');";
+        html += "          const ageStr = entry.ageMs < 1000 ? entry.ageMs + 'ms ago' : (entry.ageMs / 1000).toFixed(1) + 's ago';";
+        html += "          html += '<div style=\"margin-bottom: 15px; padding: 10px; background: #252526; border-left: 3px solid #007acc; border-radius: 4px;\">';";
+        html += "          html += '<div style=\"color: #4ec9b0; margin-bottom: 5px; font-weight: bold;\">[' + timeStr + '] (' + ageStr + ')</div>';";
+        html += "          try {";
+        html += "            const jsonObj = JSON.parse(entry.json);";
+        html += "            html += '<pre style=\"margin: 0; white-space: pre-wrap; word-wrap: break-word; color: #d4d4d4;\">' + JSON.stringify(jsonObj, null, 2) + '</pre>';";
+        html += "          } catch(e) {";
+        html += "            html += '<pre style=\"margin: 0; white-space: pre-wrap; word-wrap: break-word; color: #d4d4d4;\">' + entry.json + '</pre>';";
+        html += "          }";
+        html += "          html += '</div>';";
+        html += "        });";
+        html += "        content.innerHTML = html;";
+        html += "        status.textContent = 'Showing ' + data.count + ' messages. Auto-refreshing every 2 seconds.';";
+        html += "        content.scrollTop = content.scrollHeight;";
+        html += "      } else {";
+        html += "        content.innerHTML = '<div style=\"color: #858585; text-align: center; padding: 20px;\">No JSON messages received yet. Messages will appear here when the Shelly device sends data.</div>';";
+        html += "        status.textContent = 'No messages yet. Waiting for data from Shelly device...';";
+        html += "      }";
+        html += "    })";
+        html += "    .catch(error => {";
+        html += "      console.error('Console load error:', error);";
+        html += "      document.getElementById('consoleStatus').textContent = 'Error loading console: ' + error.message;";
+        html += "    });";
+        html += "}";
+        html += "function clearConsole() {";
+        html += "  if (confirm('Clear console buffer? This will clear the stored messages on the device.')) {";
+        html += "    fetch('/console/clear', { method: 'POST' })";
+        html += "      .then(response => response.json())";
+        html += "      .then(data => {";
+        html += "        if (data.success) {";
+        html += "          loadConsole();";
+        html += "        }";
+        html += "      })";
+        html += "      .catch(error => console.error('Clear console error:', error));";
+        html += "  }";
         html += "}";
         html += "function downloadConfig() {";
         html += "  const link = document.createElement('a');";
@@ -2077,16 +2175,16 @@ void handleHistory() {
         if (dp.timestamp == 0) {
             continue;
         }
-        
+
         if (!first) {
             server.sendContent(",");
         }
         first = false;
-        
+
         String timestampStr = formatTimestampString(dp.timestamp);
         String objStr = "{\"timestamp\":\"" + timestampStr +
-                       "\",\"Grid\":" + String(dp.grid) +
-                       ",\"Solar\":" + String(dp.solar) +
+                       "\",\"Grid\":" + String(dp.grid) + 
+                       ",\"Solar\":" + String(dp.solar) + 
                        ",\"Consumer\":" + String(dp.consumer) + "}";
         server.sendContent(objStr);
         processed++;
@@ -2260,6 +2358,55 @@ void setupWebServer() {
         String response;
         serializeJson(doc, response);
         server.send(200, "application/json", response);
+    });
+    
+    // Console endpoint to retrieve JSON message log
+    server.on("/console", []() {
+        server.sendHeader("Access-Control-Allow-Origin", "*");
+        server.sendHeader("Cache-Control", "no-cache, max-age=0");
+        
+        StaticJsonDocument<JSON_CAPACITY_MEDIUM> doc;
+        JsonArray entries = doc["entries"].to<JsonArray>();
+        
+        int count = consoleBufferFilled ? CONSOLE_BUFFER_SIZE : consoleBufferIndex;
+        int startIdx = consoleBufferFilled ? consoleBufferIndex : 0;
+        int validCount = 0;
+        
+        for (int i = 0; i < count; i++) {
+            int idx = (startIdx + i) % CONSOLE_BUFFER_SIZE;
+            if (consoleBuffer[idx].isValid) {
+                JsonObject entry = entries.add<JsonObject>();
+                entry["timestamp"] = consoleBuffer[idx].timestamp;
+                entry["json"] = consoleBuffer[idx].jsonData;
+                
+                // Calculate relative time
+                unsigned long age = millis() - consoleBuffer[idx].timestamp;
+                entry["ageMs"] = age;
+                validCount++;
+            }
+        }
+        
+        doc["count"] = validCount;
+        doc["currentTime"] = millis();
+        
+        String response;
+        serializeJson(doc, response);
+        server.send(200, "application/json", response);
+    });
+    
+    // Clear console endpoint
+    server.on("/console/clear", HTTP_POST, []() {
+        server.sendHeader("Access-Control-Allow-Origin", "*");
+        
+        // Clear the console buffer
+        for (int i = 0; i < CONSOLE_BUFFER_SIZE; i++) {
+            consoleBuffer[i].isValid = false;
+            consoleBuffer[i].jsonData = "";
+        }
+        consoleBufferIndex = 0;
+        consoleBufferFilled = false;
+        
+        server.send(200, "application/json", "{\"success\":true}");
     });
     
     server.on("/ota", HTTP_POST, []() {
@@ -2644,6 +2791,15 @@ void onMessageCallback(WebsocketsMessage message) {
     TIMED_PRINTLN("Received WebSocket message:");
     TIMED_PRINTLN(message.data());
 
+    // Store in console buffer
+    consoleBuffer[consoleBufferIndex].timestamp = millis();
+    consoleBuffer[consoleBufferIndex].jsonData = message.data();
+    consoleBuffer[consoleBufferIndex].isValid = true;
+    consoleBufferIndex = (consoleBufferIndex + 1) % CONSOLE_BUFFER_SIZE;
+    if (consoleBufferIndex == 0) {
+        consoleBufferFilled = true;
+    }
+
     static StaticJsonDocument<JSON_CAPACITY_LARGE> doc;
     doc.clear();
     DeserializationError error = deserializeJson(doc, message.data());
@@ -2763,7 +2919,7 @@ void checkAndEstablishWebSocket() {
     bool hasStoredIP = (strlen(shellyIP) > 0 && isValidShellyIP(shellyIP));
     
     if (hasStoredIP) {
-        IPAddress storedIP;
+    IPAddress storedIP;
         storedIP.fromString(shellyIP);
         bool pingOk = Ping.ping(storedIP, 1);
         TIMED_PRINTLN(pingOk ? "Stored Shelly IP responded to ping." : "Stored Shelly IP did not respond to ping.");
@@ -2784,34 +2940,34 @@ void checkAndEstablishWebSocket() {
 
     bool shouldDiscover = !connectedThisAttempt && (shellyRediscoveryNeeded || !hasStoredIP);
     if (shouldDiscover) {
-        discoverShellyDevices();
-        
-        for (auto& device : shellyDevices) {
-            if (device.type == "3EM") {
-                device.ip.toCharArray(shellyIP, sizeof(shellyIP));
-                String wsUrl = String("ws://") + shellyIP + "/rpc";
-                TIMED_PRINTLN("Connecting to " + device.type + " at: " + wsUrl);
-                
-                if (wsClient.connect(wsUrl)) {
-                    TIMED_PRINTLN("Connected to " + device.type + " WebSocket after discovery.");
-                    device.isActive = true;
-                    if (shellyDevices.size() == 1) {
+    discoverShellyDevices();
+    
+    for (auto& device : shellyDevices) {
+        if (device.type == "3EM") {
+            device.ip.toCharArray(shellyIP, sizeof(shellyIP));
+            String wsUrl = String("ws://") + shellyIP + "/rpc";
+            TIMED_PRINTLN("Connecting to " + device.type + " at: " + wsUrl);
+            
+            if (wsClient.connect(wsUrl)) {
+                TIMED_PRINTLN("Connected to " + device.type + " WebSocket after discovery.");
+                device.isActive = true;
+                if (shellyDevices.size() == 1) {
                         saveConfig();
-                    }
+                }
                     startShellySession();
                     connectedThisAttempt = true;
                     shellyRediscoveryNeeded = false;
                     shellyPingFailureCount = 0;
                     lastSuccessfulShellyPing = millis();
                     break;
-                }
             }
         }
     }
+    }
     
     if (!connectedThisAttempt) {
-        TIMED_PRINTLN("No valid Shelly 3EM device found or connection failed.");
-    }
+    TIMED_PRINTLN("No valid Shelly 3EM device found or connection failed.");
+}
 }
 
 void addToShortHistory(uint32_t timestampEpoch, int grid, int solar, int consumer) {
@@ -3134,6 +3290,14 @@ void checkFactoryResetButton() {
 
 // Main setup function
 void setup() {
+    // Initialize console buffer
+    for (int i = 0; i < CONSOLE_BUFFER_SIZE; i++) {
+        consoleBuffer[i].isValid = false;
+        consoleBuffer[i].jsonData = "";
+        consoleBuffer[i].timestamp = 0;
+    }
+    consoleBufferIndex = 0;
+    consoleBufferFilled = false;
     Serial.begin(115200);
     delay(2000);  // Give serial time to initialize
     bootCounter++;
@@ -3166,7 +3330,7 @@ void setup() {
     // Initialize physical button for factory reset
     pinMode(BUTTON_PIN, INPUT_PULLUP);  // Boot button (GPIO9) with internal pull-up
     TIMED_PRINTLN("Factory reset button initialized (GPIO" + String(BUTTON_PIN) + ")");
-    
+
     // Initialize status LED
 #ifdef USE_WS2812B_FOR_STATUS
     statusLED.begin();
@@ -3336,7 +3500,7 @@ void loop() {
             checkAndEstablishWebSocket();
         } else {
             if (activePollingEnabled) {
-                updateEnergyMeterData();
+            updateEnergyMeterData();
             } else {
                 cleanupExpiredRequests();
             }
