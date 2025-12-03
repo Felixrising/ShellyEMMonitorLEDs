@@ -117,7 +117,24 @@ const long loopDelay = 2;
 unsigned long lastDataUpdateTime = 0;
 int calculatedValue = 0;
 
-// Energy meter data structure
+// Per-channel EM state (independent tracking for each Shelly EM channel)
+struct EMChannelState {
+    uint64_t timestampMs;  // Timestamp from this channel's last update
+    int act_power;
+    float aprt_power;
+    float current;
+    float voltage;
+    unsigned long lastUpdateTime;  // Local time when we received this update
+    bool hasData;
+};
+
+EMChannelState emChannels[3] = {
+    {0, 0, 0.0, 0.0, 0.0, 0, false},
+    {0, 0, 0.0, 0.0, 0.0, 0, false},
+    {0, 0, 0.0, 0.0, 0.0, 0, false}
+};
+
+// Energy meter data structure (computed from channels)
 struct EnergyMeter { 
     String name; 
     int act_power; 
@@ -359,6 +376,9 @@ void checkAndEstablishWebSocket();
 bool isValidShellyHostname(const String& host);
 bool isValidShellyIP(const char* ip);
 void updateMeterActPower(int meterIndex, int newPower);
+void updateEMChannelState(int channelIndex, JsonObjectConst channelData, uint64_t timestampMs);
+uint64_t computeAggregateTimestamp();
+void updateMetersFromChannels();
 void storeDataPoint(uint64_t timestampMillis);
 void handleHistory();
 void handleHistory24h();
@@ -1526,8 +1546,14 @@ void handleJson() {
         doc["timezone"] = "Unknown";
     }
     
-    uint64_t timestampMs = lastShellyTimestampMs > 0 ? lastShellyTimestampMs : (deviceStartTimeMillis + millis());
+    // Use aggregate timestamp from channel states
+    uint64_t timestampMs = computeAggregateTimestamp();
+    if (timestampMs == 0) {
+        // Fallback if no channel data available
+        timestampMs = lastShellyTimestampMs > 0 ? lastShellyTimestampMs : (deviceStartTimeMillis + millis());
+    }
     doc["timestamp"] = timestampMs;
+    lastShellyTimestampMs = timestampMs;  // Update global timestamp
     
     JsonArray metersArray = doc["meters"].to<JsonArray>();
     
@@ -2250,8 +2276,12 @@ void setupWebServer() {
         server.sendHeader("Cache-Control", "no-cache, max-age=0");
         server.sendHeader("Access-Control-Allow-Origin", "*");
         
-        // Minimal JSON for real-time updates
-        uint64_t timestampMs = lastShellyTimestampMs > 0 ? lastShellyTimestampMs : (deviceStartTimeMillis + millis());
+        // Use aggregate timestamp from channel states
+        uint64_t timestampMs = computeAggregateTimestamp();
+        if (timestampMs == 0) {
+            timestampMs = lastShellyTimestampMs > 0 ? lastShellyTimestampMs : (deviceStartTimeMillis + millis());
+        }
+        
         String response = "{\"timestamp\":" + String((unsigned long long)timestampMs) + ",\"meters\":[";
         for (int i = 0; i < 3; i++) {
             if (i > 0) response += ",";
@@ -2724,6 +2754,64 @@ void updateMeterActPower(int meterIndex, int newPower) {
     }
 }
 
+// Update per-channel EM state from NotifyStatus message
+void updateEMChannelState(int channelIndex, JsonObjectConst channelData, uint64_t timestampMs) {
+    if (channelIndex < 0 || channelIndex >= 3) return;
+    
+    EMChannelState& channel = emChannels[channelIndex];
+    
+    // Update channel state
+    channel.timestampMs = timestampMs;
+    channel.act_power = (int)(channelData["act_power"] | 0.0);
+    channel.aprt_power = channelData["aprt_power"] | 0.0;
+    channel.current = channelData["current"] | 0.0;
+    channel.voltage = channelData["voltage"] | 0.0;
+    channel.lastUpdateTime = millis();
+    channel.hasData = true;
+    
+    TIMED_PRINTLN("Updated EM channel " + String(channelIndex) + " - ts: " + String(timestampMs) + "ms, power: " + String(channel.act_power) + "W");
+}
+
+// Compute aggregate timestamp as max of all channel timestamps
+uint64_t computeAggregateTimestamp() {
+    uint64_t maxTs = 0;
+    bool hasAnyData = false;
+    
+    for (int i = 0; i < 3; i++) {
+        if (emChannels[i].hasData && emChannels[i].timestampMs > maxTs) {
+            maxTs = emChannels[i].timestampMs;
+            hasAnyData = true;
+        }
+    }
+    
+    // If no channel has data, use current time
+    if (!hasAnyData) {
+        if (timeInitialized) {
+            maxTs = static_cast<uint64_t>(myTZ.now()) * 1000ULL;
+        } else {
+            maxTs = deviceStartTimeMillis + millis();
+        }
+    }
+    
+    return maxTs;
+}
+
+// Update meters array from current channel states
+void updateMetersFromChannels() {
+    for (int i = 0; i < 3; i++) {
+        if (emChannels[i].hasData) {
+            int power = emChannels[i].act_power;
+            // Apply Solar inversion if needed
+            if (meters[i].name.equalsIgnoreCase("Solar")) {
+                power = -power;
+            }
+            meters[i].act_power = power;
+            meters[i].lastUpdateTime = millis();
+        }
+    }
+    newDataAvailable = true;
+}
+
 void sendShellyGetStatus() {
     if (rpcInProgress) return;
     rpcInProgress = true;
@@ -2733,32 +2821,62 @@ void sendShellyGetStatus() {
         TIMED_PRINTLN("Shelly.GetStatus response received.");
         rpcInProgress = false;
 
-        uint64_t shellyTimestamp = extractShellyTimestampMs(response);
+        uint64_t messageTimestamp = extractShellyTimestampMs(response);
         if (response["result"].is<JsonObject>()) {
             JsonObject result = response["result"];
             
             // Support both triphase and monophase profiles
             if (result["em:0"].is<JsonObject>()) {
-                // Triphase profile - single EM component
+                // Triphase profile - single EM component with a_act_power, b_act_power, c_act_power
                 JsonObject em = result["em:0"];
-                updateMeterActPower(0, (int)(em["a_act_power"] | 0.0));
-                updateMeterActPower(1, (int)(em["b_act_power"] | 0.0));
-                updateMeterActPower(2, (int)(em["c_act_power"] | 0.0));
+                // Create temporary objects for each phase
+                StaticJsonDocument<JSON_CAPACITY_SMALL> aObj, bObj, cObj;
+                aObj["act_power"] = em["a_act_power"] | 0.0;
+                aObj["aprt_power"] = em["a_aprt_power"] | 0.0;
+                aObj["current"] = em["a_current"] | 0.0;
+                aObj["voltage"] = em["a_voltage"] | 0.0;
+                
+                bObj["act_power"] = em["b_act_power"] | 0.0;
+                bObj["aprt_power"] = em["b_aprt_power"] | 0.0;
+                bObj["current"] = em["b_current"] | 0.0;
+                bObj["voltage"] = em["b_voltage"] | 0.0;
+                
+                cObj["act_power"] = em["c_act_power"] | 0.0;
+                cObj["aprt_power"] = em["c_aprt_power"] | 0.0;
+                cObj["current"] = em["c_current"] | 0.0;
+                cObj["voltage"] = em["c_voltage"] | 0.0;
+                
+                updateEMChannelState(0, aObj.as<JsonObjectConst>(), messageTimestamp);
+                updateEMChannelState(1, bObj.as<JsonObjectConst>(), messageTimestamp);
+                updateEMChannelState(2, cObj.as<JsonObjectConst>(), messageTimestamp);
                 TIMED_PRINTLN("Updated from triphase profile");
             } else {
                 // Monophase profile - three EM1 components
-        for (int i = 0; i < 3; ++i) {
-            String key = "em1:" + String(i);
+                for (int i = 0; i < 3; ++i) {
+                    String key = "em1:" + String(i);
                     if (result[key].is<JsonObject>()) {
-                        JsonObject meter = result[key];
-                        float act_power = meter["act_power"] | 0.0;
-                        updateMeterActPower(i, (int)act_power);
+                        JsonObjectConst channelData = result[key];
+                        // Extract timestamp from this specific channel if available
+                        uint64_t channelTs = messageTimestamp;
+                        if (channelData["ts"].is<float>() || channelData["ts"].is<double>()) {
+                            double tsSeconds = channelData["ts"].as<double>();
+                            if (tsSeconds > 0) {
+                                channelTs = static_cast<uint64_t>(tsSeconds * 1000.0);
+                            }
+                        }
+                        updateEMChannelState(i, channelData, channelTs);
                     }
                 }
                 TIMED_PRINTLN("Updated from monophase profile");
             }
             
-        storeDataPoint(shellyTimestamp);
+            // Update meters from channel states and compute aggregate timestamp
+            updateMetersFromChannels();
+            uint64_t aggregateTimestamp = computeAggregateTimestamp();
+            lastShellyTimestampMs = aggregateTimestamp;
+            
+            // Store combined data point with aggregate timestamp
+            storeDataPoint(aggregateTimestamp);
         }
     });
 }
@@ -2814,27 +2932,58 @@ void onMessageCallback(WebsocketsMessage message) {
         String method = doc["method"];
         if (method == "NotifyStatus") {
             JsonObject params = doc["params"];
+            uint64_t messageTimestamp = extractShellyTimestampMs(doc);
             
             // Support both triphase and monophase profiles
             if (params["em:0"].is<JsonObject>()) {
-                // Triphase profile
+                // Triphase profile - single EM component with a_act_power, b_act_power, c_act_power
                 JsonObject em = params["em:0"];
-                updateMeterActPower(0, (int)(em["a_act_power"] | 0.0));
-                updateMeterActPower(1, (int)(em["b_act_power"] | 0.0));
-                updateMeterActPower(2, (int)(em["c_act_power"] | 0.0));
+                // Create temporary objects for each phase
+                StaticJsonDocument<JSON_CAPACITY_SMALL> aObj, bObj, cObj;
+                aObj["act_power"] = em["a_act_power"] | 0.0;
+                aObj["aprt_power"] = em["a_aprt_power"] | 0.0;
+                aObj["current"] = em["a_current"] | 0.0;
+                aObj["voltage"] = em["a_voltage"] | 0.0;
+                
+                bObj["act_power"] = em["b_act_power"] | 0.0;
+                bObj["aprt_power"] = em["b_aprt_power"] | 0.0;
+                bObj["current"] = em["b_current"] | 0.0;
+                bObj["voltage"] = em["b_voltage"] | 0.0;
+                
+                cObj["act_power"] = em["c_act_power"] | 0.0;
+                cObj["aprt_power"] = em["c_aprt_power"] | 0.0;
+                cObj["current"] = em["c_current"] | 0.0;
+                cObj["voltage"] = em["c_voltage"] | 0.0;
+                
+                updateEMChannelState(0, aObj.as<JsonObjectConst>(), messageTimestamp);
+                updateEMChannelState(1, bObj.as<JsonObjectConst>(), messageTimestamp);
+                updateEMChannelState(2, cObj.as<JsonObjectConst>(), messageTimestamp);
             } else {
-                // Monophase profile
-            for (int i = 0; i < 3; ++i) {
-                String key = "em1:" + String(i);
+                // Monophase profile - each channel updates independently
+                for (int i = 0; i < 3; ++i) {
+                    String key = "em1:" + String(i);
                     if (params[key].is<JsonObject>()) {
-                        JsonObject meter = params[key];
-                    float act_power = meter["act_power"] | 0.0;
-                    updateMeterActPower(i, (int)act_power);
+                        JsonObjectConst channelData = params[key];
+                        // Extract timestamp from this specific channel if available
+                        uint64_t channelTs = messageTimestamp;
+                        if (channelData["ts"].is<float>() || channelData["ts"].is<double>()) {
+                            double tsSeconds = channelData["ts"].as<double>();
+                            if (tsSeconds > 0) {
+                                channelTs = static_cast<uint64_t>(tsSeconds * 1000.0);
+                            }
+                        }
+                        updateEMChannelState(i, channelData, channelTs);
                     }
                 }
             }
-            uint64_t shellyTimestamp = extractShellyTimestampMs(doc);
-            storeDataPoint(shellyTimestamp);
+            
+            // Update meters from channel states and compute aggregate timestamp
+            updateMetersFromChannels();
+            uint64_t aggregateTimestamp = computeAggregateTimestamp();
+            lastShellyTimestampMs = aggregateTimestamp;
+            
+            // Store combined data point with aggregate timestamp
+            storeDataPoint(aggregateTimestamp);
         }
     } else if (doc["id"].is<int>()) {
         int id = doc["id"];
@@ -3058,11 +3207,7 @@ void storeDataPoint(uint64_t timestampMillis) {
             timestampMillis = deviceStartTimeMillis + millis();
         }
     }
-    // Only update lastShellyTimestampMs if this timestamp is newer (or within 5 seconds)
-    // This prevents older timestamps from overwriting newer ones when messages arrive out of order
-    if (timestampMillis > lastShellyTimestampMs || (lastShellyTimestampMs - timestampMillis) < 5000) {
-        lastShellyTimestampMs = timestampMillis;
-    }
+    lastShellyTimestampMs = timestampMillis;
     uint32_t timestampEpoch = static_cast<uint32_t>(timestampMillis / 1000ULL);
     
     int gridVal = 0;

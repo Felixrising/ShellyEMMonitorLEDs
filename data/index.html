@@ -1047,8 +1047,25 @@
                gridStatus.style.color = '#e74c3c'; // Red for import
            }
 
+           // Use aggregate timestamp from server (handles channel jitter)
            const sourceTimestamp = data.timestamp ? Number(data.timestamp) : Date.now();
            let timeLabel = new Date(sourceTimestamp);
+           
+           // Handle timestamp jitter gracefully for lightweight updates too
+           if (energyChart && energyChart.data.labels.length > 0) {
+               const lastTime = energyChart.data.labels[energyChart.data.labels.length - 1];
+               if (timeLabel < lastTime) {
+                   const timeDiff = lastTime.getTime() - timeLabel.getTime();
+                   if (timeDiff > 2000) {
+                       // Large jump - clamp
+                       timeLabel = new Date(lastTime.getTime() + 1000);
+                   } else {
+                       // Small jitter - clamp silently
+                       timeLabel = new Date(lastTime.getTime() + 1000);
+                   }
+               }
+           }
+           
            addRealtimePoint(timeLabel, gridPower, solarPower, consumerPower, 'none');
         })
                  .catch(error => {
@@ -1136,7 +1153,7 @@
                document.getElementById('uptimeValue').innerText = 'Uptime: ' + data.uptime;
            }
 
-           // Use timestamp from device/Shelly if provided
+           // Use timestamp from device/Shelly if provided (aggregate timestamp)
            const sourceTimestamp = data.timestamp ? Number(data.timestamp) : Date.now();
            let timeLabel = new Date(sourceTimestamp);
            
@@ -1149,29 +1166,31 @@
            let lastTime = energyChart.data.labels.length > 0 ? 
                          energyChart.data.labels[energyChart.data.labels.length - 1] : null;
            
-           // Check if this data point is older than the last history point
-           if (window.lastHistoryTimestamp && timeLabel <= window.lastHistoryTimestamp) {
-               console.warn(`Skipping real-time data point that's older than history. Current: ${timeLabel.toISOString()}, Last history: ${window.lastHistoryTimestamp.toISOString()}`);
+           // Handle timestamp jitter gracefully
+           // Only warn/reject for large unexpected jumps backwards (>2 seconds)
+           // Small jitter is normal due to independent channel updates
+           if (lastTime && timeLabel < lastTime) {
+               const timeDiff = lastTime.getTime() - timeLabel.getTime();
+               if (timeDiff > 2000) {
+                   // Large unexpected jump backwards - log once but still allow
+                   console.warn(`Large time jump backwards detected: ${timeDiff}ms. Last: ${lastTime.toISOString()}, Current: ${timeLabel.toISOString()}`);
+                   // Clamp to last time to maintain monotonicity
+                   timeLabel = new Date(lastTime.getTime() + 1000); // Add 1 second to ensure forward progress
+               } else {
+                   // Small jitter - clamp silently
+                   timeLabel = new Date(lastTime.getTime() + 1000);
+               }
+           }
+           
+           // Don't reject points that are slightly before history end - this is normal
+           // History buckets have different timestamps than live samples
+           if (window.lastHistoryTimestamp && timeLabel.getTime() < window.lastHistoryTimestamp.getTime() - 5000) {
+               // Only skip if more than 5 seconds behind history (likely stale data)
+               console.warn(`Skipping data point significantly older than history. Current: ${timeLabel.toISOString()}, Last history: ${window.lastHistoryTimestamp.toISOString()}`);
                return;
            }
            
-           // Allow small timestamp differences (within 30 seconds) to handle out-of-order messages
-           // addRealtimePoint will insert in correct chronological position anyway
-           const timeDiff = lastTime ? (timeLabel.getTime() - lastTime.getTime()) : 0;
-           if (lastTime && timeLabel < lastTime && Math.abs(timeDiff) > 30000) {
-               console.warn(`Time going backwards significantly! Last: ${lastTime.toISOString()}, Current: ${timeLabel.toISOString()}, Diff: ${timeDiff}ms`);
-               return; // Only reject if more than 30 seconds backwards
-           }
-           
-           // Log only if significant time difference (not for every point to reduce console noise)
-           if (!lastTime || Math.abs(timeDiff) > 5000) {
-               console.log(`Adding chart point at ${timeLabel.toISOString()}: Grid=${gridPower}W, Solar=${solarPower}W, Consumer=${consumerPower}W`);
-           }
            addRealtimePoint(timeLabel, gridPower, solarPower, consumerPower);
-           // Only log chart update occasionally to reduce console noise
-           if (energyChart.data.labels.length % 10 === 0) {
-               console.log(`Chart updated. Total points: ${energyChart.data.labels.length}`);
-           }
         })
         .catch(error => {
            clearTimeout(timeoutId);
