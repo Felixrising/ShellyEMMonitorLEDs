@@ -1155,15 +1155,23 @@
                return;
            }
            
-           // Debug logging for time issues
-           if (lastTime && timeLabel < lastTime) {
-               console.warn(`Time going backwards! Last: ${lastTime.toISOString()}, Current: ${timeLabel.toISOString()}`);
-               return; // Don't add data that goes backwards
+           // Allow small timestamp differences (within 30 seconds) to handle out-of-order messages
+           // addRealtimePoint will insert in correct chronological position anyway
+           const timeDiff = lastTime ? (timeLabel.getTime() - lastTime.getTime()) : 0;
+           if (lastTime && timeLabel < lastTime && Math.abs(timeDiff) > 30000) {
+               console.warn(`Time going backwards significantly! Last: ${lastTime.toISOString()}, Current: ${timeLabel.toISOString()}, Diff: ${timeDiff}ms`);
+               return; // Only reject if more than 30 seconds backwards
            }
            
-           console.log(`Adding chart point at ${timeLabel.toISOString()}: Grid=${gridPower}W, Solar=${solarPower}W, Consumer=${consumerPower}W`);
+           // Log only if significant time difference (not for every point to reduce console noise)
+           if (!lastTime || Math.abs(timeDiff) > 5000) {
+               console.log(`Adding chart point at ${timeLabel.toISOString()}: Grid=${gridPower}W, Solar=${solarPower}W, Consumer=${consumerPower}W`);
+           }
            addRealtimePoint(timeLabel, gridPower, solarPower, consumerPower);
-           console.log(`Chart updated. Total points: ${energyChart.data.labels.length}`);
+           // Only log chart update occasionally to reduce console noise
+           if (energyChart.data.labels.length % 10 === 0) {
+               console.log(`Chart updated. Total points: ${energyChart.data.labels.length}`);
+           }
         })
         .catch(error => {
            clearTimeout(timeoutId);

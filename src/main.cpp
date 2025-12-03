@@ -3058,7 +3058,11 @@ void storeDataPoint(uint64_t timestampMillis) {
             timestampMillis = deviceStartTimeMillis + millis();
         }
     }
-    lastShellyTimestampMs = timestampMillis;
+    // Only update lastShellyTimestampMs if this timestamp is newer (or within 5 seconds)
+    // This prevents older timestamps from overwriting newer ones when messages arrive out of order
+    if (timestampMillis > lastShellyTimestampMs || (lastShellyTimestampMs - timestampMillis) < 5000) {
+        lastShellyTimestampMs = timestampMillis;
+    }
     uint32_t timestampEpoch = static_cast<uint32_t>(timestampMillis / 1000ULL);
     
     int gridVal = 0;
